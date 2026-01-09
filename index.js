@@ -1,4 +1,4 @@
-// index.js - Maleficis Plantaciones + Chester + Tienda (Railway ready)
+// index.js - Maleficis Plantaciones + Chester + Tienda + Tramportista (Railway ready)
 require("dotenv").config();
 
 const fs = require("fs");
@@ -47,10 +47,11 @@ const CHESTER_CD_MS = 24 * 60 * 60 * 1000; // 24h
 const TIENDA_CD_SOLO_MS = 5 * 60 * 60 * 1000;  // 5h
 const TIENDA_CD_GRUPO_MS = 2 * 60 * 60 * 1000; // 2h
 // Reinicios ARG: 00:00 / 08:00 / 16:00
-const TIENDA_RESET_HOURS = [0, 8, 16]; // horario local ARG (si Railway corre en UTC, usá TZ)
+const RESET_HOURS = [0, 8, 16]; // horario local ARG (usar TZ=America/Argentina/Buenos_Aires en Railway)
 
-// Use TZ Argentina en Railway: TZ=America/Argentina/Buenos_Aires
-// (ponelo en Variables del servicio)
+// Tramportista (1 vez por reinicio)
+const TRAMPORTISTA_IMAGE =
+  "https://static.wikia.nocookie.net/esgta/images/2/2f/YankeeviejoGTAV.jpg/revision/latest?cb=20141205120106";
 
 // =====================
 // SIMPLE FILE DB
@@ -74,8 +75,12 @@ function saveJSON(file, data) {
 
 const DB = {
   plantaciones: loadJSON("plantaciones.json", []),
-  chester: loadJSON("chester.json", {}), // { userId: { jobName: nextReadyTs, jobName_notified: bool } }
-  tienda: loadJSON("tienda.json", {}),   // { userId: { "modo|nombre": nextReadyTs, "modo|nombre_notified": bool } }
+  chester: loadJSON("chester.json", {}), // { userId: { job: ts, job_notified: bool } }
+  tienda: loadJSON("tienda.json", {}),   // { userId: { "modo|nombre": ts, "modo|nombre_notified": bool } }
+  tramportista: loadJSON("tramportista.json", {
+    resetKey: null,     // "YYYY-MM-DD|HH"
+    done: {},           // { userId: true }
+  }),
   registro: loadJSON("registro.json", []),
 };
 
@@ -123,11 +128,21 @@ async function safeFetchMessage(channel, messageId) {
   try { return await channel.messages.fetch(messageId); } catch { return null; }
 }
 
+function capFirst(s) {
+  if (!s) return s;
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
 // =====================
 // DISCORD CLIENT
 // =====================
+// ⚠️ GuildMembers intent necesario para /tramportista_lista (quienes NO lo hicieron)
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMembers,
+  ],
   partials: [Partials.Channel],
 });
 
@@ -173,11 +188,11 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("chester")
-    .setDescription("Abrir panel de trabajos de Chester (CD 24h por trabajo) (VISIBLE PARA TODOS)"),
+    .setDescription("🧰 Chester: panel de trabajos (CD 24h por trabajo) (público)"),
 
   new SlashCommandBuilder()
     .setName("tienda")
-    .setDescription("Iniciar cooldown de robo a tienda (solo/grupo)")
+    .setDescription("🏪 Iniciar cooldown de robo a tienda (solo/grupo)")
     .addStringOption(opt =>
       opt.setName("modo")
         .setDescription("Modo")
@@ -192,6 +207,17 @@ const commands = [
         .setDescription("Nombre/tienda (ej: 24/7, armería, joyería)")
         .setRequired(true)
     ),
+
+  // ✅ Tramportista
+  new SlashCommandBuilder()
+    .setName("tramportista")
+    .setDescription("🚚 Marca que hiciste el Tramportista (1 vez por reinicio 00/08/16)"),
+
+  // ✅ Tramportista lista (ADMIN)
+  new SlashCommandBuilder()
+    .setName("tramportista_lista")
+    .setDescription("ADMIN: ver quién hizo y quién no el Tramportista en este reinicio")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   new SlashCommandBuilder()
     .setName("registro")
@@ -258,7 +284,7 @@ function plantEmbed(p) {
   const created = p.createdAt ?? now();
 
   const e = new EmbedBuilder()
-    .setTitle(`Plantación #${p.id}`)
+    .setTitle(`🌿 Plantación #${p.id}`)
     .setColor(p.tipo === "duplicar" ? 0x2ecc71 : 0x3498db)
     .setFooter({ text: "Maleficis • Plantaciones" })
     .setTimestamp(new Date(created));
@@ -268,26 +294,26 @@ function plantEmbed(p) {
     : "Sin descripción.";
 
   e.addFields(
-    { name: "Descripción", value: desc, inline: false },
-    { name: "Tipo", value: fmtTipo(p.tipo), inline: true },
-    { name: "Plantó", value: `<@${p.createdBy}>`, inline: true },
-    { name: "Creada", value: absTs(created), inline: false },
+    { name: "📝 Descripción", value: desc, inline: false },
+    { name: "📌 Tipo", value: fmtTipo(p.tipo), inline: true },
+    { name: "👤 Plantó", value: `<@${p.createdBy}>`, inline: true },
+    { name: "📅 Creada", value: absTs(created), inline: false },
   );
 
   if (p.tipo === "duplicar") {
     const readyAt = p.readyAt;
     const isReady = now() >= readyAt;
     e.addFields(
-      { name: "Estado", value: isReady ? "✅ Lista para cultivar" : "🌱 Creciendo", inline: true },
-      { name: "Cultivar", value: isReady ? "Ahora" : relTs(readyAt), inline: true },
+      { name: "📍 Estado", value: isReady ? "✅ Lista para cultivar" : "🌱 Creciendo", inline: true },
+      { name: "🧪 Cultivar", value: isReady ? "Ahora" : relTs(readyAt), inline: true },
     );
   } else {
     const regarAt = p.nextWaterAt;
     const cosecharAt = p.nextHarvestAt;
     e.addFields(
-      { name: "Estado", value: `Cosechas: **${p.harvestCount}/${MAX_COSECHAS}**`, inline: false },
-      { name: "Próximo riego", value: relTs(regarAt), inline: true },
-      { name: "Próxima cosecha", value: relTs(cosecharAt), inline: true },
+      { name: "📍 Progreso", value: `Cosechas: **${p.harvestCount}/${MAX_COSECHAS}**`, inline: false },
+      { name: "💧 Próximo riego", value: relTs(regarAt), inline: true },
+      { name: "🧺 Próxima cosecha", value: relTs(cosecharAt), inline: true },
     );
   }
 
@@ -298,40 +324,63 @@ function plantEmbed(p) {
 
 function chesterEmbed(userId) {
   const e = new EmbedBuilder()
-    .setTitle(`Chester • Trabajos (panel de <@${userId}>)`)
-    .setDescription("Marcá el trabajo que hiciste. Se te avisará cuando vuelva a estar disponible.\n**Este panel es público para control**, pero solo el dueño puede apretar botones.")
+    .setTitle(`🧰 Chester • Trabajos`)
+    .setDescription(
+      `Panel de: **${userId ? `<@${userId}>` : "—"}**\n` +
+      `Marcá el trabajo que hiciste y te aviso cuando vuelva a estar disponible.\n` +
+      `🔒 **Solo el dueño del panel** puede apretar los botones.`
+    )
     .setColor(0x9b59b6)
     .setFooter({ text: "Maleficis • Chester" });
 
   const lines = CHESTER_JOBS.map(job => {
     const nextTs = DB.chester?.[userId]?.[job] || 0;
     const available = now() >= nextTs;
+
+    const nice = capFirst(job);
     return available
-      ? `• **${job}** — ✅ disponible`
-      : `• **${job}** — ⏳ ${relTs(nextTs)}`;
+      ? `✅ **${nice}** — Disponible`
+      : `⏳ **${nice}** — ${relTs(nextTs)}`;
   });
 
-  e.addFields({ name: "Estado", value: lines.join("\n"), inline: false });
+  e.addFields({ name: "📋 Estado", value: lines.join("\n"), inline: false });
   return e;
 }
 
 function tiendaEmbed(userId, modo, nombre, nextTs) {
   const e = new EmbedBuilder()
-    .setTitle("Robo a tienda • Cooldown")
+    .setTitle("🏪 Robo a tienda • Cooldown")
     .setColor(0xe67e22)
     .setFooter({ text: "Maleficis • Tiendas" });
 
   e.addFields(
-    { name: "Usuario", value: `<@${userId}>`, inline: true },
-    { name: "Modo", value: modo === "grupo" ? "Grupo (2h)" : "Solo (5h)", inline: true },
-    { name: "Tienda", value: nombre, inline: false },
-    { name: "Disponible", value: relTs(nextTs), inline: true },
+    { name: "👤 Usuario", value: `<@${userId}>`, inline: true },
+    { name: "👥 Modo", value: modo === "grupo" ? "Grupo (2h)" : "Solo (5h)", inline: true },
+    { name: "📍 Tienda", value: nombre, inline: false },
+    { name: "✅ Disponible", value: relTs(nextTs), inline: true },
   );
 
   return e;
 }
 
-// Buttons builders
+function tramportistaEmbed(userId, resetKey) {
+  const e = new EmbedBuilder()
+    .setTitle("🚚 Tramportista • Registrado")
+    .setDescription(
+      `👤 **Hecho por:** <@${userId}>\n` +
+      `🕒 **Reinicio actual:** \`${resetKey}\`\n` +
+      `✅ **Estado:** Registrado para este reinicio.`
+    )
+    .setColor(0x1abc9c)
+    .setFooter({ text: "Maleficis • Tramportista" })
+    .setImage(TRAMPORTISTA_IMAGE)
+    .setTimestamp(new Date(now()));
+  return e;
+}
+
+// =====================
+// BUTTONS
+// =====================
 function chesterButtons(userId) {
   const rows = [];
   let currentRow = new ActionRowBuilder();
@@ -341,9 +390,12 @@ function chesterButtons(userId) {
     const nextTs = DB.chester?.[userId]?.[job] || 0;
     const available = now() >= nextTs;
 
+    const nice = capFirst(job);
+    const label = available ? `✅ ${nice}` : `⏳ ${nice}`;
+
     const btn = new ButtonBuilder()
       .setCustomId(`chester_${job}_${userId}`)
-      .setLabel(job)
+      .setLabel(label.slice(0, 80))
       .setStyle(available ? ButtonStyle.Primary : ButtonStyle.Secondary)
       .setDisabled(!available);
 
@@ -365,7 +417,7 @@ function registroButtons() {
     new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setCustomId("registro_borrar")
-        .setLabel("Borrar registro")
+        .setLabel("🗑️ Borrar registro")
         .setStyle(ButtonStyle.Danger)
     )
   ];
@@ -378,7 +430,7 @@ async function ensurePlantMessage(p) {
   const ch = await safeFetchChannel(client, p.channelId);
   if (!ch) return;
 
-  // si ya está terminada (por alguna razón) => borrá mensaje y sacala
+  // si ya está terminada => borrá mensaje y sacala
   if (p.tipo === "cosecha" && (p.harvestCount || 0) >= MAX_COSECHAS) {
     await deletePlantMessage(p);
     removePlant(p.id);
@@ -420,7 +472,7 @@ async function sendPlantAlert(p, kind) {
       new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId(`plant_cultivar_${p.id}`)
-          .setLabel("Cultivar")
+          .setLabel("🌿 Cultivar")
           .setStyle(ButtonStyle.Success)
       )
     );
@@ -430,7 +482,7 @@ async function sendPlantAlert(p, kind) {
       row.addComponents(
         new ButtonBuilder()
           .setCustomId(`plant_regar_${p.id}`)
-          .setLabel("Regar")
+          .setLabel("💧 Regar")
           .setStyle(ButtonStyle.Primary)
       );
     }
@@ -438,7 +490,7 @@ async function sendPlantAlert(p, kind) {
       row.addComponents(
         new ButtonBuilder()
           .setCustomId(`plant_cosechar_${p.id}`)
-          .setLabel("Cosechar")
+          .setLabel("🧺 Cosechar")
           .setStyle(ButtonStyle.Success)
       );
     }
@@ -463,12 +515,36 @@ function isNotifiedKey(k) {
   return typeof k === "string" && k.endsWith("_notified");
 }
 
+// =====================
+// RESET KEY (Tramportista)
+// =====================
+function getResetKeyFromDate(d) {
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}|${hh}`;
+}
+
+function ensureTramportistaResetKeyCurrent() {
+  const d = new Date();
+  const hour = d.getHours();
+  // Si no estamos en horas de reset, mantenemos el resetKey existente (si existe).
+  // Pero si está vacío, lo inicializamos igual con la hora actual.
+  const key = getResetKeyFromDate(d);
+  if (!DB.tramportista.resetKey) {
+    DB.tramportista.resetKey = key;
+    saveJSON("tramportista.json", DB.tramportista);
+  }
+  return DB.tramportista.resetKey;
+}
+
 // Main loop checks each 20s
 setInterval(async () => {
   // Plantaciones: check due alerts
   for (const p of DB.plantaciones) {
     try {
-      // Blindaje: si ya está terminada => borrá mensaje y removela
+      // Blindaje: si ya está terminada => borrar mensaje y remover
       if (p.tipo === "cosecha" && (p.harvestCount || 0) >= MAX_COSECHAS) {
         await deletePlantMessage(p);
         removePlant(p.id);
@@ -496,7 +572,7 @@ setInterval(async () => {
   // Chester: remind users when a job becomes ready
   for (const userId of Object.keys(DB.chester)) {
     for (const job of Object.keys(DB.chester[userId] || {})) {
-      if (isNotifiedKey(job)) continue; // ✅ FIX
+      if (isNotifiedKey(job)) continue;
 
       const ts = DB.chester[userId][job];
       if (!ts || typeof ts !== "number") continue;
@@ -507,7 +583,7 @@ setInterval(async () => {
 
         try {
           const user = await client.users.fetch(userId);
-          await user.send(`✅ Ya puedes hacer el trabajo de **${job}**.`);
+          await user.send(`✅ Ya puedes hacer el trabajo de **${capFirst(job)}**.`);
         } catch {}
       }
     }
@@ -516,7 +592,7 @@ setInterval(async () => {
   // Tienda: remind users when a cooldown becomes ready
   for (const userId of Object.keys(DB.tienda)) {
     for (const key of Object.keys(DB.tienda[userId] || {})) {
-      if (isNotifiedKey(key)) continue; // ✅ FIX
+      if (isNotifiedKey(key)) continue;
 
       const ts = DB.tienda[userId][key];
       if (!ts || typeof ts !== "number") continue;
@@ -539,19 +615,27 @@ setInterval(async () => {
 
 }, 20 * 1000);
 
-// Tienda resets at 00/08/16 ARG: check every minute
+// Resets at 00/08/16 ARG: check every minute
 setInterval(() => {
   const d = new Date();
   const hour = d.getHours();
   const min = d.getMinutes();
 
   if (min !== 0) return;
-  if (!TIENDA_RESET_HOURS.includes(hour)) return;
+  if (!RESET_HOURS.includes(hour)) return;
 
+  // ✅ Reset Tienda
   DB.tienda = {};
   saveJSON("tienda.json", DB.tienda);
-  logReg({ type: "tienda_reset", at: now(), by: "system", meta: { hour } });
-  console.log(`🟧 Tienda cooldowns reseteados por reinicio horario (${hour}:00).`);
+
+  // ✅ Reset Tramportista
+  DB.tramportista.resetKey = getResetKeyFromDate(d);
+  DB.tramportista.done = {};
+  saveJSON("tramportista.json", DB.tramportista);
+
+  logReg({ type: "reset_horario", at: now(), by: "system", meta: { hour, resetKey: DB.tramportista.resetKey } });
+
+  console.log(`🟧 Reset horario aplicado (${hour}:00). Tienda y Tramportista reseteados.`);
 }, 60 * 1000);
 
 // =====================
@@ -579,6 +663,20 @@ function resetAllTienda() {
 function resetAllChester() {
   DB.chester = {};
   saveJSON("chester.json", DB.chester);
+}
+
+// =====================
+// REGISTRO: nombres humanos
+// =====================
+async function resolveUserLabel(userId) {
+  if (!userId || userId === "system") return "Sistema";
+  try {
+    const u = await client.users.fetch(userId);
+    const name = u.globalName || u.username || "Usuario";
+    return `${name} (<@${userId}>)`;
+  } catch {
+    return `Desconocido (<@${userId}>)`;
+  }
 }
 
 // =====================
@@ -636,7 +734,12 @@ client.on("interactionCreate", async (interaction) => {
           type: "plantacion_creada",
           at: now(),
           by: interaction.user.id,
-          meta: { plantId: p.id, tipo, descripcion: descripcion || null },
+          meta: {
+            byName: interaction.user.globalName || interaction.user.username,
+            plantId: p.id,
+            tipo,
+            descripcion: descripcion || null
+          },
         });
 
         return;
@@ -652,14 +755,14 @@ client.on("interactionCreate", async (interaction) => {
           const num = i + 1;
           if (p.tipo === "duplicar") {
             const ready = now() >= p.readyAt ? "✅ lista" : relTs(p.readyAt);
-            return `**#${num}** → Plantación **#${p.id}** • **Duplicar** • ${p.descripcion || "Sin descripción"} • Cultivar: ${ready}`;
+            return `**#${num}** → 🌿 **#${p.id}** • **Duplicar** • ${p.descripcion || "Sin descripción"} • Cultivar: ${ready}`;
           } else {
-            return `**#${num}** → Plantación **#${p.id}** • **Cosecha** • ${p.descripcion || "Sin descripción"} • Riego: ${relTs(p.nextWaterAt)} • Cosecha: ${relTs(p.nextHarvestAt)} • (${p.harvestCount}/${MAX_COSECHAS})`;
+            return `**#${num}** → 🌱 **#${p.id}** • **Cosecha** • ${p.descripcion || "Sin descripción"} • 💧 ${relTs(p.nextWaterAt)} • 🧺 ${relTs(p.nextHarvestAt)} • (**${p.harvestCount}/${MAX_COSECHAS}**)`;
           }
         });
 
         const e = new EmbedBuilder()
-          .setTitle("Plantaciones activas")
+          .setTitle("🌿 Plantaciones activas")
           .setColor(0x95a5a6)
           .setDescription(lines.join("\n"))
           .setFooter({ text: "Usa /borrarplantacion numero:X si querés eliminar una." });
@@ -675,12 +778,17 @@ client.on("interactionCreate", async (interaction) => {
         await deletePlantMessage(p);
         removePlant(p.id);
 
-        logReg({ type: "plantacion_borrada", at: now(), by: interaction.user.id, meta: { plantId: p.id } });
+        logReg({
+          type: "plantacion_borrada",
+          at: now(),
+          by: interaction.user.id,
+          meta: { byName: interaction.user.globalName || interaction.user.username, plantId: p.id }
+        });
 
         return interaction.reply({ ephemeral: true, content: `🗑️ Plantación #${p.id} eliminada.` });
       }
 
-      // ✅ Chester VISIBLE PARA TODOS
+      // ✅ Chester público
       if (name === "chester") {
         const userId = interaction.user.id;
         if (!DB.chester[userId]) DB.chester[userId] = {};
@@ -689,7 +797,6 @@ client.on("interactionCreate", async (interaction) => {
         const e = chesterEmbed(userId);
         const rows = chesterButtons(userId);
 
-        // 👇 antes estaba ephemeral:true
         return interaction.reply({ ephemeral: false, embeds: [e], components: rows });
       }
 
@@ -705,7 +812,12 @@ client.on("interactionCreate", async (interaction) => {
         DB.tienda[interaction.user.id][`${key}_notified`] = false;
         saveJSON("tienda.json", DB.tienda);
 
-        logReg({ type: "tienda_inicio", at: now(), by: interaction.user.id, meta: { modo, nombre } });
+        logReg({
+          type: "tienda_inicio",
+          at: now(),
+          by: interaction.user.id,
+          meta: { byName: interaction.user.globalName || interaction.user.username, modo, nombre }
+        });
 
         const e = tiendaEmbed(interaction.user.id, modo, nombre, now() + cd);
 
@@ -714,6 +826,90 @@ client.on("interactionCreate", async (interaction) => {
           embeds: [e],
           content: "✅ Cooldown iniciado. Te avisaré por DM cuando puedas volver a hacerlo.",
         });
+      }
+
+      // ✅ Tramportista (1 vez por reinicio)
+      if (name === "tramportista") {
+        const resetKey = ensureTramportistaResetKeyCurrent();
+        const userId = interaction.user.id;
+
+        // Si el resetKey guardado es viejo y justo reinició, lo resetea el scheduler; igual lo mantenemos
+        if (!DB.tramportista.done) DB.tramportista.done = {};
+
+        if (DB.tramportista.done[userId]) {
+          return interaction.reply({
+            ephemeral: true,
+            content: `⚠️ Ya registraste el **Tramportista** en este reinicio (**${resetKey}**).`,
+          });
+        }
+
+        DB.tramportista.done[userId] = true;
+        saveJSON("tramportista.json", DB.tramportista);
+
+        logReg({
+          type: "tramportista_hecho",
+          at: now(),
+          by: userId,
+          meta: { byName: interaction.user.globalName || interaction.user.username, resetKey }
+        });
+
+        const e = tramportistaEmbed(userId, resetKey);
+
+        return interaction.reply({
+          ephemeral: false,
+          embeds: [e],
+          content: `🚚 **Tramportista registrado** por <@${userId}>.`,
+        });
+      }
+
+      // ✅ Tramportista lista (ADMIN)
+      if (name === "tramportista_lista") {
+        const guild = interaction.guild;
+        if (!guild) return interaction.reply({ ephemeral: true, content: "Esto solo funciona en un servidor." });
+
+        const resetKey = ensureTramportistaResetKeyCurrent();
+        const doneMap = DB.tramportista.done || {};
+        const doneIds = Object.keys(doneMap).filter(id => doneMap[id]);
+
+        // Traer miembros del server
+        let members;
+        try {
+          members = await guild.members.fetch();
+        } catch {
+          return interaction.reply({
+            ephemeral: true,
+            content:
+              "No pude traer la lista de miembros. Activá **SERVER MEMBERS INTENT** en el Developer Portal y asegurate de tener `GuildMembers` intent.",
+          });
+        }
+
+        const allHumans = members
+          .filter(m => !m.user.bot)
+          .map(m => m.user.id);
+
+        const notDoneIds = allHumans.filter(id => !doneMap[id]);
+
+        // Hacerlo legible
+        const doneLines = doneIds.length
+          ? doneIds.slice(0, 80).map(id => `✅ ${members.get(id)?.user?.globalName || members.get(id)?.user?.username || "Usuario"} (<@${id}>)`).join("\n")
+          : "— Nadie todavía.";
+
+        const notDoneLines = notDoneIds.length
+          ? notDoneIds.slice(0, 80).map(id => `❌ ${members.get(id)?.user?.globalName || members.get(id)?.user?.username || "Usuario"} (<@${id}>)`).join("\n")
+          : "— Todos lo hicieron.";
+
+        const e = new EmbedBuilder()
+          .setTitle("🚚 Tramportista • Estado (Admin)")
+          .setDescription(`🕒 Reinicio actual: \`${resetKey}\``)
+          .setColor(0x16a085)
+          .addFields(
+            { name: `✅ Hechos (${doneIds.length})`, value: doneLines.slice(0, 1024), inline: false },
+            { name: `❌ No hechos (${notDoneIds.length})`, value: notDoneLines.slice(0, 1024), inline: false },
+          )
+          .setImage(TRAMPORTISTA_IMAGE)
+          .setFooter({ text: "Maleficis • Tramportista" });
+
+        return interaction.reply({ ephemeral: true, embeds: [e] });
       }
 
       // ✅ Reset personal
@@ -730,7 +926,12 @@ client.on("interactionCreate", async (interaction) => {
           did = a || b;
         }
 
-        logReg({ type: "reset_mis_cd", at: now(), by: userId, meta: { tipo } });
+        logReg({
+          type: "reset_mis_cd",
+          at: now(),
+          by: userId,
+          meta: { byName: interaction.user.globalName || interaction.user.username, tipo }
+        });
 
         return interaction.reply({
           ephemeral: true,
@@ -757,21 +958,35 @@ client.on("interactionCreate", async (interaction) => {
             did = a || b;
           }
 
-          logReg({ type: "admin_reset_cd", at: now(), by: interaction.user.id, meta: { tipo, userId: targetId } });
+          logReg({
+            type: "admin_reset_cd",
+            at: now(),
+            by: interaction.user.id,
+            meta: {
+              byName: interaction.user.globalName || interaction.user.username,
+              tipo,
+              userId: targetId,
+              userName: usuario.globalName || usuario.username
+            }
+          });
 
           return interaction.reply({
             ephemeral: true,
             content: did
-              ? `✅ Cooldowns reseteados para <@${targetId}> (**${tipo}**).`
-              : `ℹ️ <@${targetId}> no tenía cooldowns guardados para resetear (**${tipo}**).`,
+              ? `✅ Cooldowns reseteados para **${usuario.globalName || usuario.username}** (<@${targetId}>) (**${tipo}**).`
+              : `ℹ️ **${usuario.globalName || usuario.username}** (<@${targetId}>) no tenía cooldowns guardados (**${tipo}**).`,
           });
         } else {
-          // reset a TODOS
           if (tipo === "tienda") resetAllTienda();
           if (tipo === "chester") resetAllChester();
           if (tipo === "todo") { resetAllTienda(); resetAllChester(); }
 
-          logReg({ type: "admin_reset_cd_all", at: now(), by: interaction.user.id, meta: { tipo } });
+          logReg({
+            type: "admin_reset_cd_all",
+            at: now(),
+            by: interaction.user.id,
+            meta: { byName: interaction.user.globalName || interaction.user.username, tipo }
+          });
 
           return interaction.reply({
             ephemeral: true,
@@ -792,6 +1007,7 @@ client.on("interactionCreate", async (interaction) => {
           return interaction.reply({ ephemeral: true, content: "No hay registros para mostrar." });
         }
 
+        // Group by "by"
         const byUser = {};
         for (const e of filtered) {
           const u = e.by || "system";
@@ -799,8 +1015,15 @@ client.on("interactionCreate", async (interaction) => {
           byUser[u].push(e);
         }
 
+        // Resolver nombres (max 10 usuarios para no matarnos)
+        const userIds = Object.keys(byUser).slice(0, 10);
+        const labels = {};
+        for (const uid of userIds) {
+          labels[uid] = await resolveUserLabel(uid);
+        }
+
         const blocks = Object.entries(byUser).map(([u, arr]) => {
-          const who = u === "system" ? "**Sistema**" : `<@${u}>`;
+          const who = labels[u] || (u === "system" ? "Sistema" : `(<@${u}>)`);
           const lines = arr
             .sort((a, b) => a.at - b.at)
             .slice(-25)
@@ -810,8 +1033,10 @@ client.on("interactionCreate", async (interaction) => {
 
               let detail = "";
               if (t.startsWith("plantacion")) detail = ev.meta?.plantId ? `(#${ev.meta.plantId})` : "";
-              if (t.startsWith("chester")) detail = ev.meta?.job ? `(${ev.meta.job})` : "";
+              if (t.startsWith("chester")) detail = ev.meta?.job ? `(${capFirst(ev.meta.job)})` : "";
               if (t.startsWith("tienda")) detail = ev.meta?.nombre ? `(${ev.meta.modo} • ${ev.meta.nombre})` : "";
+              if (t.startsWith("tramportista")) detail = ev.meta?.resetKey ? `(${ev.meta.resetKey})` : "";
+
               return `• ${when} — **${t}** ${detail}`.trim();
             });
 
@@ -819,12 +1044,12 @@ client.on("interactionCreate", async (interaction) => {
         });
 
         const e = new EmbedBuilder()
-          .setTitle(usuario ? `Registro • ${usuario.username}` : "Registro • General")
+          .setTitle(usuario ? `📚 Registro • ${usuario.globalName || usuario.username}` : "📚 Registro • General")
           .setColor(0x34495e)
           .setDescription("Resumen por usuario (últimos eventos por usuario).");
 
         for (const b of blocks.slice(0, 8)) {
-          e.addFields({ name: b.who, value: b.lines.join("\n").slice(0, 1024) || "—", inline: false });
+          e.addFields({ name: b.who.slice(0, 256), value: (b.lines.join("\n") || "—").slice(0, 1024), inline: false });
         }
 
         return interaction.reply({
@@ -848,15 +1073,19 @@ client.on("interactionCreate", async (interaction) => {
         const p = DB.plantaciones.find(x => x.id === plantId);
         if (!p) return interaction.reply({ ephemeral: true, content: "Esa plantación ya no existe." });
 
-        // duplicar -> cultivar only if ready
+        // duplicar -> cultivar
         if (p.tipo === "duplicar" && action === "cultivar") {
           if (now() < p.readyAt) {
             return interaction.reply({ ephemeral: true, content: `Aún no está lista. Cultivar ${relTs(p.readyAt)}.` });
           }
 
-          logReg({ type: "plantacion_cultivada", at: now(), by: interaction.user.id, meta: { plantId: p.id } });
+          logReg({
+            type: "plantacion_cultivada",
+            at: now(),
+            by: interaction.user.id,
+            meta: { byName: interaction.user.globalName || interaction.user.username, plantId: p.id }
+          });
 
-          // ✅ borrar embed principal de la plantación
           await deletePlantMessage(p);
           removePlant(p.id);
 
@@ -877,7 +1106,12 @@ client.on("interactionCreate", async (interaction) => {
               alertedWater: false,
             });
 
-            logReg({ type: "plantacion_regada", at: now(), by: interaction.user.id, meta: { plantId: p.id } });
+            logReg({
+              type: "plantacion_regada",
+              at: now(),
+              by: interaction.user.id,
+              meta: { byName: interaction.user.globalName || interaction.user.username, plantId: p.id }
+            });
 
             const updated = DB.plantaciones.find(x => x.id === p.id);
             await ensurePlantMessage(updated);
@@ -892,10 +1126,14 @@ client.on("interactionCreate", async (interaction) => {
 
             const newCount = (p.harvestCount || 0) + 1;
 
-            logReg({ type: "plantacion_cosechada", at: now(), by: interaction.user.id, meta: { plantId: p.id, count: newCount } });
+            logReg({
+              type: "plantacion_cosechada",
+              at: now(),
+              by: interaction.user.id,
+              meta: { byName: interaction.user.globalName || interaction.user.username, plantId: p.id, count: newCount }
+            });
 
             if (newCount >= MAX_COSECHAS) {
-              // ✅ finaliza: borrar embed/mensaje principal del bot y remover
               await deletePlantMessage(p);
               removePlant(p.id);
 
@@ -924,9 +1162,9 @@ client.on("interactionCreate", async (interaction) => {
       if (id.startsWith("chester_")) {
         const [, job, userId] = id.split("_");
 
-        // ✅ público para ver, pero solo el dueño clickea
+        // público para ver, pero solo el dueño clickea
         if (interaction.user.id !== userId) {
-          return interaction.reply({ ephemeral: true, content: "Este panel es personal. Usá /chester para el tuyo." });
+          return interaction.reply({ ephemeral: true, content: "🔒 Este panel es personal. Usá **/chester** para el tuyo." });
         }
 
         if (!CHESTER_JOBS.includes(job)) {
@@ -936,14 +1174,19 @@ client.on("interactionCreate", async (interaction) => {
         if (!DB.chester[userId]) DB.chester[userId] = {};
         const nextTs = DB.chester[userId][job] || 0;
         if (now() < nextTs) {
-          return interaction.reply({ ephemeral: true, content: `Aún en cooldown. Disponible ${relTs(nextTs)}.` });
+          return interaction.reply({ ephemeral: true, content: `⏳ Aún en cooldown. Disponible ${relTs(nextTs)}.` });
         }
 
         DB.chester[userId][job] = now() + CHESTER_CD_MS;
         DB.chester[userId][`${job}_notified`] = false;
         saveJSON("chester.json", DB.chester);
 
-        logReg({ type: "chester_job", at: now(), by: interaction.user.id, meta: { job } });
+        logReg({
+          type: "chester_job",
+          at: now(),
+          by: interaction.user.id,
+          meta: { byName: interaction.user.globalName || interaction.user.username, job }
+        });
 
         const e = chesterEmbed(userId);
         const rows = chesterButtons(userId);
@@ -964,7 +1207,7 @@ client.on("interactionCreate", async (interaction) => {
         saveJSON("registro.json", DB.registro);
 
         return interaction.update({
-          embeds: [new EmbedBuilder().setTitle("Registro").setDescription("🗑️ Registro eliminado.").setColor(0x2ecc71)],
+          embeds: [new EmbedBuilder().setTitle("📚 Registro").setDescription("🗑️ Registro eliminado.").setColor(0x2ecc71)],
           components: [],
         });
       }
@@ -987,6 +1230,9 @@ client.once("ready", async () => {
   for (const p of DB.plantaciones) {
     await ensurePlantMessage(p);
   }
+
+  // init resetKey for tramportista if missing
+  ensureTramportistaResetKeyCurrent();
 });
 
 (async () => {
@@ -998,6 +1244,7 @@ client.once("ready", async () => {
   await registerCommands();
   await client.login(TOKEN);
 })();
+
 
 
 
