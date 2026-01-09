@@ -47,7 +47,7 @@ const CHESTER_CD_MS = 24 * 60 * 60 * 1000; // 24h
 const TIENDA_CD_SOLO_MS = 5 * 60 * 60 * 1000;  // 5h
 const TIENDA_CD_GRUPO_MS = 2 * 60 * 60 * 1000; // 2h
 // Reinicios ARG: 00:00 / 08:00 / 16:00
-const TIENDA_RESET_HOURS = [0, 8, 16]; // horario local ARG (si Railway corre en UTC, usamos TZ)
+const TIENDA_RESET_HOURS = [0, 8, 16]; // horario local ARG (si Railway corre en UTC, usá TZ)
 
 // Use TZ Argentina en Railway: TZ=America/Argentina/Buenos_Aires
 // (ponelo en Variables del servicio)
@@ -74,8 +74,8 @@ function saveJSON(file, data) {
 
 const DB = {
   plantaciones: loadJSON("plantaciones.json", []),
-  chester: loadJSON("chester.json", {}), // { userId: { jobName: nextReadyTs } }
-  tienda: loadJSON("tienda.json", {}),   // { userId: { key: nextReadyTs } }
+  chester: loadJSON("chester.json", {}), // { userId: { jobName: nextReadyTs, jobName_notified: bool } }
+  tienda: loadJSON("tienda.json", {}),   // { userId: { "modo|nombre": nextReadyTs, "modo|nombre_notified": bool } }
   registro: loadJSON("registro.json", []),
 };
 
@@ -86,7 +86,7 @@ function logReg(entry) {
 
 function now() { return Date.now(); }
 function toUnix(ms) { return Math.floor(ms / 1000); }
-function relTs(ms) { return `<t:${toUnix(ms)}:R>`; } // "in 2 hours" auto-updates client-side
+function relTs(ms) { return `<t:${toUnix(ms)}:R>`; } // auto-updates client-side
 function absTs(ms) { return `<t:${toUnix(ms)}:f>`; } // full date
 
 function fmtTipo(tipo) {
@@ -99,7 +99,6 @@ function nextPlantId() {
 }
 
 function getPlantByNumber(n) {
-  // list order is by id asc
   const list = [...DB.plantaciones].sort((a, b) => a.id - b.id);
   return list[n - 1] || null;
 }
@@ -174,7 +173,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("chester")
-    .setDescription("Abrir panel de trabajos de Chester (CD 24h por trabajo)"),
+    .setDescription("Abrir panel de trabajos de Chester (CD 24h por trabajo) (VISIBLE PARA TODOS)"),
 
   new SlashCommandBuilder()
     .setName("tienda")
@@ -203,6 +202,43 @@ const commands = [
         .setDescription("Filtrar por usuario")
         .setRequired(false)
     ),
+
+  // ✅ Reset personal (cualquiera)
+  new SlashCommandBuilder()
+    .setName("resetmiscd")
+    .setDescription("Resetea TUS cooldowns personales (tienda/chester/todo)")
+    .addStringOption(opt =>
+      opt.setName("tipo")
+        .setDescription("Qué querés resetear")
+        .setRequired(true)
+        .addChoices(
+          { name: "Tienda", value: "tienda" },
+          { name: "Chester", value: "chester" },
+          { name: "Todo", value: "todo" },
+        )
+    ),
+
+  // ✅ Reset admin (usuario o todos)
+  new SlashCommandBuilder()
+    .setName("resetcd")
+    .setDescription("ADMIN: Resetea cooldowns de un usuario o de todos")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption(opt =>
+      opt.setName("tipo")
+        .setDescription("Qué querés resetear")
+        .setRequired(true)
+        .addChoices(
+          { name: "Tienda", value: "tienda" },
+          { name: "Chester", value: "chester" },
+          { name: "Todo", value: "todo" },
+        )
+    )
+    .addUserOption(opt =>
+      opt.setName("usuario")
+        .setDescription("Usuario a resetear (si lo dejás vacío, resetea A TODOS)")
+        .setRequired(false)
+    ),
+
 ].map(c => c.toJSON());
 
 // Register commands on start
@@ -238,7 +274,6 @@ function plantEmbed(p) {
     { name: "Creada", value: absTs(created), inline: false },
   );
 
-  // Status + next actions
   if (p.tipo === "duplicar") {
     const readyAt = p.readyAt;
     const isReady = now() >= readyAt;
@@ -263,8 +298,8 @@ function plantEmbed(p) {
 
 function chesterEmbed(userId) {
   const e = new EmbedBuilder()
-    .setTitle("Chester • Trabajos")
-    .setDescription("Marcá el trabajo que hiciste. Se te avisará cuando vuelva a estar disponible.")
+    .setTitle(`Chester • Trabajos (panel de <@${userId}>)`)
+    .setDescription("Marcá el trabajo que hiciste. Se te avisará cuando vuelva a estar disponible.\n**Este panel es público para control**, pero solo el dueño puede apretar botones.")
     .setColor(0x9b59b6)
     .setFooter({ text: "Maleficis • Chester" });
 
@@ -297,25 +332,6 @@ function tiendaEmbed(userId, modo, nombre, nextTs) {
 }
 
 // Buttons builders
-function plantButtons(p) {
-  // IMPORTANT: only show buttons when corresponding alert is sent
-  const row = new ActionRowBuilder();
-
-  if (p.tipo === "duplicar") {
-    row.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`plant_cultivar_${p.id}`)
-        .setLabel("Cultivar")
-        .setStyle(ButtonStyle.Success)
-    );
-    return [row];
-  }
-
-  // Cosecha: may show regar and/or cosechar depending alert type
-  // We'll build in alert sender, not here.
-  return [];
-}
-
 function chesterButtons(userId) {
   const rows = [];
   let currentRow = new ActionRowBuilder();
@@ -362,7 +378,13 @@ async function ensurePlantMessage(p) {
   const ch = await safeFetchChannel(client, p.channelId);
   if (!ch) return;
 
-  // if message exists, edit it. else create it.
+  // si ya está terminada (por alguna razón) => borrá mensaje y sacala
+  if (p.tipo === "cosecha" && (p.harvestCount || 0) >= MAX_COSECHAS) {
+    await deletePlantMessage(p);
+    removePlant(p.id);
+    return;
+  }
+
   let msg = null;
   if (p.messageId) msg = await safeFetchMessage(ch, p.messageId);
 
@@ -392,7 +414,6 @@ async function sendPlantAlert(p, kind) {
 
   const embed = plantEmbed(p);
 
-  // Build only relevant buttons
   const rows = [];
   if (p.tipo === "duplicar") {
     rows.push(
@@ -435,15 +456,24 @@ async function sendPlantAlert(p, kind) {
   await ch.send({ content: title, embeds: [embed], components: rows }).catch(() => {});
 }
 
+// =====================
+// FIX CLAVE: NO iterar *_notified como si fuera un cooldown real
+// =====================
+function isNotifiedKey(k) {
+  return typeof k === "string" && k.endsWith("_notified");
+}
+
 // Main loop checks each 20s
 setInterval(async () => {
   // Plantaciones: check due alerts
   for (const p of DB.plantaciones) {
     try {
-      // keep main embed message updated (timestamps auto-update, but harvest count etc might change)
-      // We can refresh this every ~2 minutes; but ok to do lightweight edit occasionally.
-      // We'll only edit when something changed via actions; so here we skip.
-      // (kept for future)
+      // Blindaje: si ya está terminada => borrá mensaje y removela
+      if (p.tipo === "cosecha" && (p.harvestCount || 0) >= MAX_COSECHAS) {
+        await deletePlantMessage(p);
+        removePlant(p.id);
+        continue;
+      }
 
       if (p.tipo === "duplicar") {
         if (!p.alertedReady && now() >= p.readyAt) {
@@ -466,8 +496,12 @@ setInterval(async () => {
   // Chester: remind users when a job becomes ready
   for (const userId of Object.keys(DB.chester)) {
     for (const job of Object.keys(DB.chester[userId] || {})) {
+      if (isNotifiedKey(job)) continue; // ✅ FIX
+
       const ts = DB.chester[userId][job];
-      if (ts && !DB.chester[userId][`${job}_notified`] && now() >= ts) {
+      if (!ts || typeof ts !== "number") continue;
+
+      if (!DB.chester[userId][`${job}_notified`] && now() >= ts) {
         DB.chester[userId][`${job}_notified`] = true;
         saveJSON("chester.json", DB.chester);
 
@@ -482,11 +516,18 @@ setInterval(async () => {
   // Tienda: remind users when a cooldown becomes ready
   for (const userId of Object.keys(DB.tienda)) {
     for (const key of Object.keys(DB.tienda[userId] || {})) {
+      if (isNotifiedKey(key)) continue; // ✅ FIX
+
       const ts = DB.tienda[userId][key];
-      if (ts && !DB.tienda[userId][`${key}_notified`] && now() >= ts) {
+      if (!ts || typeof ts !== "number") continue;
+
+      if (!DB.tienda[userId][`${key}_notified`] && now() >= ts) {
         DB.tienda[userId][`${key}_notified`] = true;
         saveJSON("tienda.json", DB.tienda);
-        const [modo, nombre] = key.split("|");
+
+        const [modoRaw, nombreRaw] = key.split("|");
+        const modo = (modoRaw || "solo").toLowerCase();
+        const nombre = (nombreRaw || "tienda").trim();
 
         try {
           const user = await client.users.fetch(userId);
@@ -507,12 +548,38 @@ setInterval(() => {
   if (min !== 0) return;
   if (!TIENDA_RESET_HOURS.includes(hour)) return;
 
-  // Clear tienda cooldowns only (and their notified flags)
   DB.tienda = {};
   saveJSON("tienda.json", DB.tienda);
   logReg({ type: "tienda_reset", at: now(), by: "system", meta: { hour } });
   console.log(`🟧 Tienda cooldowns reseteados por reinicio horario (${hour}:00).`);
 }, 60 * 1000);
+
+// =====================
+// RESET HELPERS
+// =====================
+function resetTiendaForUser(userId) {
+  if (!DB.tienda[userId]) return false;
+  delete DB.tienda[userId];
+  saveJSON("tienda.json", DB.tienda);
+  return true;
+}
+
+function resetChesterForUser(userId) {
+  if (!DB.chester[userId]) return false;
+  delete DB.chester[userId];
+  saveJSON("chester.json", DB.chester);
+  return true;
+}
+
+function resetAllTienda() {
+  DB.tienda = {};
+  saveJSON("tienda.json", DB.tienda);
+}
+
+function resetAllChester() {
+  DB.chester = {};
+  saveJSON("chester.json", DB.chester);
+}
 
 // =====================
 // INTERACTIONS
@@ -538,7 +605,6 @@ client.on("interactionCreate", async (interaction) => {
           channelId: interaction.channelId,
           messageId: null,
 
-          // state
           harvestCount: 0,
           readyAt: null,
           nextWaterAt: null,
@@ -614,6 +680,7 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ ephemeral: true, content: `🗑️ Plantación #${p.id} eliminada.` });
       }
 
+      // ✅ Chester VISIBLE PARA TODOS
       if (name === "chester") {
         const userId = interaction.user.id;
         if (!DB.chester[userId]) DB.chester[userId] = {};
@@ -622,7 +689,8 @@ client.on("interactionCreate", async (interaction) => {
         const e = chesterEmbed(userId);
         const rows = chesterButtons(userId);
 
-        return interaction.reply({ ephemeral: true, embeds: [e], components: rows });
+        // 👇 antes estaba ephemeral:true
+        return interaction.reply({ ephemeral: false, embeds: [e], components: rows });
       }
 
       if (name === "tienda") {
@@ -648,10 +716,74 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
+      // ✅ Reset personal
+      if (name === "resetmiscd") {
+        const tipo = interaction.options.getString("tipo", true);
+        const userId = interaction.user.id;
+
+        let did = false;
+        if (tipo === "tienda") did = resetTiendaForUser(userId);
+        if (tipo === "chester") did = resetChesterForUser(userId);
+        if (tipo === "todo") {
+          const a = resetTiendaForUser(userId);
+          const b = resetChesterForUser(userId);
+          did = a || b;
+        }
+
+        logReg({ type: "reset_mis_cd", at: now(), by: userId, meta: { tipo } });
+
+        return interaction.reply({
+          ephemeral: true,
+          content: did
+            ? `✅ Listo. Se resetearon tus cooldowns (**${tipo}**).`
+            : `ℹ️ No tenías cooldowns guardados para resetear (**${tipo}**).`,
+        });
+      }
+
+      // ✅ Reset admin
+      if (name === "resetcd") {
+        const tipo = interaction.options.getString("tipo", true);
+        const usuario = interaction.options.getUser("usuario"); // opcional
+
+        if (usuario) {
+          const targetId = usuario.id;
+          let did = false;
+
+          if (tipo === "tienda") did = resetTiendaForUser(targetId);
+          if (tipo === "chester") did = resetChesterForUser(targetId);
+          if (tipo === "todo") {
+            const a = resetTiendaForUser(targetId);
+            const b = resetChesterForUser(targetId);
+            did = a || b;
+          }
+
+          logReg({ type: "admin_reset_cd", at: now(), by: interaction.user.id, meta: { tipo, userId: targetId } });
+
+          return interaction.reply({
+            ephemeral: true,
+            content: did
+              ? `✅ Cooldowns reseteados para <@${targetId}> (**${tipo}**).`
+              : `ℹ️ <@${targetId}> no tenía cooldowns guardados para resetear (**${tipo}**).`,
+          });
+        } else {
+          // reset a TODOS
+          if (tipo === "tienda") resetAllTienda();
+          if (tipo === "chester") resetAllChester();
+          if (tipo === "todo") { resetAllTienda(); resetAllChester(); }
+
+          logReg({ type: "admin_reset_cd_all", at: now(), by: interaction.user.id, meta: { tipo } });
+
+          return interaction.reply({
+            ephemeral: true,
+            content: `✅ Cooldowns reseteados para **TODOS** (**${tipo}**).`,
+          });
+        }
+      }
+
       if (name === "registro") {
         const usuario = interaction.options.getUser("usuario");
 
-        const entries = DB.registro.slice(); // all
+        const entries = DB.registro.slice();
         const filtered = usuario
           ? entries.filter(e => e.by === usuario.id || e.meta?.userId === usuario.id)
           : entries;
@@ -660,7 +792,6 @@ client.on("interactionCreate", async (interaction) => {
           return interaction.reply({ ephemeral: true, content: "No hay registros para mostrar." });
         }
 
-        // Group by user
         const byUser = {};
         for (const e of filtered) {
           const u = e.by || "system";
@@ -672,7 +803,7 @@ client.on("interactionCreate", async (interaction) => {
           const who = u === "system" ? "**Sistema**" : `<@${u}>`;
           const lines = arr
             .sort((a, b) => a.at - b.at)
-            .slice(-25) // limit per user to avoid huge messages
+            .slice(-25)
             .map(ev => {
               const when = absTs(ev.at);
               const t = ev.type;
@@ -723,9 +854,9 @@ client.on("interactionCreate", async (interaction) => {
             return interaction.reply({ ephemeral: true, content: `Aún no está lista. Cultivar ${relTs(p.readyAt)}.` });
           }
 
-          // log + delete embed + remove
           logReg({ type: "plantacion_cultivada", at: now(), by: interaction.user.id, meta: { plantId: p.id } });
 
+          // ✅ borrar embed principal de la plantación
           await deletePlantMessage(p);
           removePlant(p.id);
 
@@ -743,12 +874,11 @@ client.on("interactionCreate", async (interaction) => {
             updatePlant({
               id: p.id,
               nextWaterAt: newWaterAt,
-              alertedWater: false, // allow next alert
+              alertedWater: false,
             });
 
             logReg({ type: "plantacion_regada", at: now(), by: interaction.user.id, meta: { plantId: p.id } });
 
-            // update embed message
             const updated = DB.plantaciones.find(x => x.id === p.id);
             await ensurePlantMessage(updated);
 
@@ -765,7 +895,7 @@ client.on("interactionCreate", async (interaction) => {
             logReg({ type: "plantacion_cosechada", at: now(), by: interaction.user.id, meta: { plantId: p.id, count: newCount } });
 
             if (newCount >= MAX_COSECHAS) {
-              // done: delete embed + remove
+              // ✅ finaliza: borrar embed/mensaje principal del bot y remover
               await deletePlantMessage(p);
               removePlant(p.id);
 
@@ -777,7 +907,7 @@ client.on("interactionCreate", async (interaction) => {
               id: p.id,
               harvestCount: newCount,
               nextHarvestAt: newHarvestAt,
-              alertedHarvest: false, // allow next alert
+              alertedHarvest: false,
             });
 
             const updated = DB.plantaciones.find(x => x.id === p.id);
@@ -793,6 +923,8 @@ client.on("interactionCreate", async (interaction) => {
       // ===== Chester =====
       if (id.startsWith("chester_")) {
         const [, job, userId] = id.split("_");
+
+        // ✅ público para ver, pero solo el dueño clickea
         if (interaction.user.id !== userId) {
           return interaction.reply({ ephemeral: true, content: "Este panel es personal. Usá /chester para el tuyo." });
         }
@@ -813,7 +945,6 @@ client.on("interactionCreate", async (interaction) => {
 
         logReg({ type: "chester_job", at: now(), by: interaction.user.id, meta: { job } });
 
-        // update panel
         const e = chesterEmbed(userId);
         const rows = chesterButtons(userId);
 
@@ -825,7 +956,6 @@ client.on("interactionCreate", async (interaction) => {
 
       // ===== Registro =====
       if (id === "registro_borrar") {
-        // only admins
         const member = interaction.member;
         const isAdmin = member?.permissions?.has?.(PermissionFlagsBits.Administrator);
         if (!isAdmin) return interaction.reply({ ephemeral: true, content: "Solo administradores." });
@@ -853,7 +983,7 @@ client.on("interactionCreate", async (interaction) => {
 client.once("ready", async () => {
   console.log(`🤖 Bot listo: ${client.user.tag}`);
 
-  // ensure all plant embeds exist
+  // ensure all plant embeds exist (y limpia las terminadas)
   for (const p of DB.plantaciones) {
     await ensurePlantMessage(p);
   }
@@ -868,5 +998,6 @@ client.once("ready", async () => {
   await registerCommands();
   await client.login(TOKEN);
 })();
+
 
 
