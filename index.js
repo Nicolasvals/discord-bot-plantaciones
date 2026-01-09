@@ -1,142 +1,294 @@
+// index.js
+// Bot Plantaciones (Cosecha/Duplicar) + Registro Admin por usuario
+// discord.js v14
+
 require("dotenv").config();
+const fs = require("fs");
+const path = require("path");
 const {
   Client,
   GatewayIntentBits,
+  Partials,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  PermissionFlagsBits,
   EmbedBuilder,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  SlashCommandBuilder,
-  REST,
-  Routes,
-  PermissionsBitField,
+  ChannelType,
+  AttachmentBuilder
 } = require("discord.js");
 
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
-});
+// =========================
+// ENV
+// =========================
+const TOKEN = process.env.TOKEN;
+const CLIENT_ID = process.env.CLIENT_ID;
+const GUILD_ID = process.env.GUILD_ID;
 
-// =====================
-// CONFIG
-// =====================
-const TZ = "America/Argentina/Buenos_Aires";
-
-// Plantaciones
-const T_REGAR = 2 * 60 * 60 * 1000 + 40 * 60 * 1000; // 2h40m
-const T_COSECHAR = 3 * 60 * 60 * 1000;               // 3h
-const T_DUPLICAR = 3 * 60 * 60 * 1000;               // 3h (1 sola vez)
-
-// Chester
-const T_CHESTER = 24 * 60 * 60 * 1000;               // 24h
-
-// Tienda
-const T_TIENDA_SOLO  = 5 * 60 * 60 * 1000;           // 5h
-const T_TIENDA_GRUPO = 2 * 60 * 60 * 1000;           // 2h
-const TIENDA_RESETS = new Set(["00:00", "08:00", "16:00"]); // AR
-
-// Ping plantaciones
-const PLANT_PING = "@everyone"; // o "@here"
-
-// =====================
-// DATA (en memoria)
-// =====================
-let plantaciones = [];   // activas
-let registro = [];       // registro global (todo)
-let chesterTasks = [];   // { userId, userTag, job, channelId, dueAt, notified }
-let tiendaTasks = [];    // { userId, userTag, mode, channelId, dueAt, notified }
-
-const CHESTER_JOBS = [
-  "molotov",
-  "parking",
-  "ventanillas",
-  "ruedas",
-  "grafitis",
-  "peleas",
-  "transporte",
-  "coche",
-];
-
-let lastTiendaResetKey = ""; // evita reset doble en el mismo minuto
-
-// =====================
-// UTILS
-// =====================
-function now() {
-  return Date.now();
+if (!TOKEN || !CLIENT_ID || !GUILD_ID) {
+  console.error("[FATAL] Falta TOKEN, CLIENT_ID o GUILD_ID en variables de entorno.");
+  process.exit(1);
 }
 
-function fechaAR() {
-  return new Date().toLocaleString("es-AR", { timeZone: TZ });
+// =========================
+// DATA (JSON)
+// =========================
+const DATA_DIR = path.join(__dirname, "data");
+const PLANTS_FILE = path.join(DATA_DIR, "plantaciones.json");
+const LOG_FILE = path.join(DATA_DIR, "registro.json");
+
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+ensureDataDir();
+
+function loadJSON(file, fallback) {
+  try {
+    if (!fs.existsSync(file)) return fallback;
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (e) {
+    console.error("[DATA] Error leyendo", file, e);
+    return fallback;
+  }
 }
 
-function hmAR() {
-  const parts = new Intl.DateTimeFormat("es-AR", {
-    timeZone: TZ,
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).formatToParts(new Date());
-
-  const h = parts.find(p => p.type === "hour")?.value ?? "00";
-  const m = parts.find(p => p.type === "minute")?.value ?? "00";
-  return `${h}:${m}`;
+function saveJSON(file, data) {
+  try {
+    fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8");
+  } catch (e) {
+    console.error("[DATA] Error guardando", file, e);
+  }
 }
 
-function msToHM(ms) {
-  const t = Math.max(0, ms);
-  const h = Math.floor(t / 3600000);
-  const m = Math.floor((t % 3600000) / 60000);
-  return `${h}h ${m}m`;
+// Estructura:
+// plantaciones = [{ id, tipo, descripcion, imageUrl, createdBy, createdAt, embedChannelId, embedMessageId, notifyChannelId,
+//                  nextWaterAt, nextHarvestAt, harvestCount, done, lastAlertMessageId }]
+let plantaciones = loadJSON(PLANTS_FILE, []);
+let registro = loadJSON(LOG_FILE, []); // [{ts, userId, userTag, action, details}]
+
+// Genera ID incremental simple
+function nextPlantId() {
+  const max = plantaciones.reduce((m, p) => Math.max(m, p.id), 0);
+  return max + 1;
 }
 
-function id() {
-  return `${Date.now()}_${Math.floor(Math.random() * 999999)}`;
+// =========================
+// TIEMPOS
+// =========================
+const MS = 1000;
+const MIN = 60 * MS;
+const HOUR = 60 * MIN;
+
+const WATER_INTERVAL = (2 * HOUR) + (40 * MIN); // 2:40
+const HARVEST_INTERVAL = 3 * HOUR;              // 3:00
+const DUPLICATE_READY = 3 * HOUR;               // 3:00
+
+function now() { return Date.now(); }
+
+function fmtMs(ms) {
+  if (ms <= 0) return "00:00:00";
+  const total = Math.floor(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(h)}:${pad(m)}:${pad(s)}`;
 }
 
-function niceTitle(tipo) {
-  return tipo === "duplicar" ? "🌿 Plantación (Duplicar semillas)" : "🌱 Plantación (Cosecha)";
+function fmtDate(ts) {
+  // Argentina (aprox, Discord mostrará bien por timestamp)
+  const d = new Date(ts);
+  return d.toLocaleString("es-AR", { hour12: false });
 }
 
-function addLog(line) {
-  // Para que no se vaya infinito, recortamos a 400 entradas (ajustable)
-  registro.push(line);
-  if (registro.length > 400) registro = registro.slice(-400);
+function addLog(user, action, details) {
+  const entry = {
+    ts: now(),
+    userId: user.id,
+    userTag: `${user.username}${user.discriminator ? "#" + user.discriminator : ""}`,
+    action,
+    details
+  };
+  registro.push(entry);
+  saveJSON(LOG_FILE, registro);
 }
 
-function buildPlantEmbed(p, extra = {}) {
+// =========================
+// EMBEDS
+// =========================
+function baseColor(tipo) {
+  return tipo === "duplicar" ? 0x2bb673 : 0x3aa0ff;
+}
+
+function buildPlantEmbed(p) {
+  const tipoNombre = p.tipo === "duplicar" ? "Duplicar semillas" : "Cosecha";
   const e = new EmbedBuilder()
-    .setTitle(niceTitle(p.tipo))
-    .setColor(p.tipo === "duplicar" ? 0x7CFF6B : 0x00FFB2)
-    .setDescription(`**📝 Descripción:** ${p.descripcion || "Sin descripción"}`)
+    .setColor(baseColor(p.tipo))
+    .setTitle(`Plantación #${p.id}`)
+    .setDescription(p.descripcion ? p.descripcion : "Sin descripción")
     .addFields(
-      { name: "📦 Tipo", value: p.tipo === "duplicar" ? "Duplicar" : "Cosecha", inline: true },
-      { name: "🆔 ID", value: `\`${p.id}\``, inline: true },
+      { name: "Tipo", value: tipoNombre, inline: true },
+      { name: "Plantó", value: `<@${p.createdBy}>`, inline: true },
+      { name: "Creada", value: `${fmtDate(p.createdAt)}`, inline: false }
     )
-    .setFooter({ text: extra.footer || "Sistema de timers" })
-    .setTimestamp();
+    .setFooter({ text: "Maleficis • Plantaciones" });
 
-  if (p.tipo === "cosecha") {
+  if (p.imageUrl) e.setImage(p.imageUrl);
+
+  // Estado
+  if (p.done) {
+    e.addFields({ name: "Estado", value: "Finalizada ✅", inline: false });
+    return e;
+  }
+
+  if (p.tipo === "duplicar") {
+    const remaining = (p.createdAt + DUPLICATE_READY) - now();
     e.addFields(
-      { name: "🌾 Cosechas", value: `${p.cosechas}/3`, inline: true }
+      { name: "Estado", value: remaining <= 0 ? "Lista para cultivar 🌿" : "Creciendo", inline: true },
+      { name: "Cultivar en", value: remaining <= 0 ? "Disponible" : fmtMs(remaining), inline: true }
+    );
+  } else {
+    const wRem = p.nextWaterAt - now();
+    const hRem = p.nextHarvestAt - now();
+    const waterTxt = wRem <= 0 ? "Disponible" : fmtMs(wRem);
+    const harvestTxt = hRem <= 0 ? "Disponible" : fmtMs(hRem);
+
+    e.addFields(
+      { name: "Riego", value: waterTxt, inline: true },
+      { name: "Cosecha", value: harvestTxt, inline: true },
+      { name: "Cosechas", value: `${p.harvestCount}/3`, inline: true }
     );
   }
 
   return e;
 }
 
-function buildAlertEmbed(title, desc, color) {
-  return new EmbedBuilder()
-    .setTitle(title)
-    .setDescription(desc)
-    .setColor(color)
-    .setFooter({ text: "Respondé con el botón para registrar la acción" })
-    .setTimestamp();
+// Aviso “limpio” (borra el aviso anterior de esa plantación, si existe)
+async function sendCleanAlert(client, p, content, components) {
+  const chId = p.notifyChannelId || p.embedChannelId;
+  const ch = await client.channels.fetch(chId).catch(() => null);
+  if (!ch || ch.type !== ChannelType.GuildText) return;
+
+  // borrar alerta previa
+  if (p.lastAlertMessageId) {
+    const old = await ch.messages.fetch(p.lastAlertMessageId).catch(() => null);
+    if (old) await old.delete().catch(() => null);
+  }
+
+  const msg = await ch.send({ content, components }).catch(() => null);
+  if (msg) {
+    p.lastAlertMessageId = msg.id;
+    saveJSON(PLANTS_FILE, plantaciones);
+  }
 }
 
-// =====================
+function btn(customId, label, style = ButtonStyle.Primary) {
+  return new ButtonBuilder().setCustomId(customId).setLabel(label).setStyle(style);
+}
+
+function actionRow(buttons) {
+  return new ActionRowBuilder().addComponents(buttons);
+}
+
+async function updatePlantEmbed(client, p) {
+  const ch = await client.channels.fetch(p.embedChannelId).catch(() => null);
+  if (!ch || ch.type !== ChannelType.GuildText) return;
+  const msg = await ch.messages.fetch(p.embedMessageId).catch(() => null);
+  if (!msg) return;
+
+  const embed = buildPlantEmbed(p);
+  await msg.edit({ embeds: [embed] }).catch(() => null);
+}
+
+async function deletePlantEmbed(client, p) {
+  const ch = await client.channels.fetch(p.embedChannelId).catch(() => null);
+  if (!ch || ch.type !== ChannelType.GuildText) return;
+  const msg = await ch.messages.fetch(p.embedMessageId).catch(() => null);
+  if (msg) await msg.delete().catch(() => null);
+
+  // también borra la última alerta si existe
+  const notifyId = p.notifyChannelId || p.embedChannelId;
+  const nch = await client.channels.fetch(notifyId).catch(() => null);
+  if (nch && nch.type === ChannelType.GuildText && p.lastAlertMessageId) {
+    const old = await nch.messages.fetch(p.lastAlertMessageId).catch(() => null);
+    if (old) await old.delete().catch(() => null);
+  }
+}
+
+// =========================
+// SCHEDULER (chequea plantaciones)
+// =========================
+async function tick(client) {
+  const t = now();
+  let changed = false;
+
+  for (const p of plantaciones) {
+    if (p.done) continue;
+
+    if (p.tipo === "duplicar") {
+      const readyAt = p.createdAt + DUPLICATE_READY;
+      if (t >= readyAt) {
+        // manda aviso (solo botón cultivar)
+        const row = actionRow([
+          btn(`plant:harvest:${p.id}`, "Cultivar", ButtonStyle.Success),
+        ]);
+
+        await sendCleanAlert(
+          client,
+          p,
+          `@here 🌿 **Plantación #${p.id}** lista para **cultivar**.`,
+          [row]
+        );
+
+        // actualiza embed para mostrar "Disponible"
+        await updatePlantEmbed(client, p);
+      }
+    } else {
+      // Cosecha: avisos separados según lo que toque
+      const needsWater = t >= p.nextWaterAt;
+      const needsHarvest = t >= p.nextHarvestAt;
+
+      // Si ambas a la vez, avisamos ambas y mostramos dos botones
+      if (needsWater || needsHarvest) {
+        const buttons = [];
+        if (needsWater) buttons.push(btn(`plant:water:${p.id}`, "Regar", ButtonStyle.Primary));
+        if (needsHarvest) buttons.push(btn(`plant:harvest:${p.id}`, "Cosechar", ButtonStyle.Success));
+
+        const row = actionRow(buttons);
+
+        const msgBits = [];
+        if (needsWater) msgBits.push("regar");
+        if (needsHarvest) msgBits.push("cosechar");
+
+        await sendCleanAlert(
+          client,
+          p,
+          `@here 🌱 **Plantación #${p.id}** lista para **${msgBits.join(" y ")}**.`,
+          [row]
+        );
+
+        await updatePlantEmbed(client, p);
+      }
+    }
+  }
+
+  if (changed) {
+    saveJSON(PLANTS_FILE, plantaciones);
+  }
+}
+
+// Corre cada 20s (sin spam)
+function startScheduler(client) {
+  setInterval(() => tick(client).catch(console.error), 20 * 1000);
+}
+
+// =========================
 // SLASH COMMANDS
-// =====================
-const comandos = [
+// =========================
+const commands = [
   new SlashCommandBuilder()
     .setName("plantacion")
     .setDescription("Crear una plantación (cosecha o duplicar)")
@@ -151,567 +303,409 @@ const comandos = [
     )
     .addStringOption(o =>
       o.setName("descripcion")
-        .setDescription("Descripción (opcional)")
+        .setDescription("Descripción opcional (ej: Puerta, Garaje...)")
+        .setRequired(false)
+    )
+    .addChannelOption(o =>
+      o.setName("canal_embed")
+        .setDescription("Canal donde quedará el embed fijo de la plantación (opcional)")
+        .addChannelTypes(ChannelType.GuildText)
+        .setRequired(false)
+    )
+    .addChannelOption(o =>
+      o.setName("canal_alertas")
+        .setDescription("Canal donde avisará @here cuando toque (opcional)")
+        .addChannelTypes(ChannelType.GuildText)
+        .setRequired(false)
+    )
+    .addAttachmentOption(o =>
+      o.setName("imagen")
+        .setDescription("Imagen opcional")
         .setRequired(false)
     ),
 
   new SlashCommandBuilder()
     .setName("plantaciones")
-    .setDescription("Ver plantaciones activas (#1 #2 #3...)"),
+    .setDescription("Ver lista de plantaciones activas"),
 
   new SlashCommandBuilder()
     .setName("borrarplantacion")
-    .setDescription("Borrar una plantación por número (#1 #2 #3...)")
+    .setDescription("Borrar plantación por número (#1, #2...)")
     .addIntegerOption(o =>
       o.setName("numero")
-        .setDescription("Número de la lista (ej: 1)")
+        .setDescription("Número de la plantación (ej: 1)")
         .setRequired(true)
-    ),
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   new SlashCommandBuilder()
     .setName("registro")
-    .setDescription("Ver registro completo (ADMIN)"),
+    .setDescription("Ver registro de actividad (ADMIN). Opcional: filtrar por usuario.")
+    .addUserOption(o =>
+      o.setName("usuario")
+        .setDescription("Usuario a consultar (opcional)")
+        .setRequired(false)
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+].map(c => c.toJSON());
 
-  new SlashCommandBuilder()
-    .setName("chester")
-    .setDescription("Panel de trabajos de Chester (CD 24h)"),
+// =========================
+// DISCORD CLIENT
+// =========================
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds],
+  partials: [Partials.Channel]
+});
 
-  new SlashCommandBuilder()
-    .setName("tienda")
-    .setDescription("CD de robos de tienda (solo/grupo)")
-    .addStringOption(o =>
-      o.setName("modo")
-        .setDescription("Modo del robo")
-        .setRequired(true)
-        .addChoices(
-          { name: "Solo (5h)", value: "solo" },
-          { name: "Grupo (2h)", value: "grupo" }
-        )
-    ),
-];
-
-// =====================
+// =========================
 // REGISTER COMMANDS
-// =====================
-const rest = new REST({ version: "10" }).setToken(process.env.TOKEN);
+// =========================
+async function registerCommands() {
+  const rest = new REST({ version: "10" }).setToken(TOKEN);
+  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+  console.log("[OK] Slash commands registrados en el servidor.");
+}
 
-(async () => {
-  await rest.put(
-    Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
-    { body: comandos.map(c => c.toJSON()) }
+// =========================
+// HELPERS
+// =========================
+function isAdmin(interaction) {
+  return interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+}
+
+function findPlantById(id) {
+  return plantaciones.find(p => p.id === id && !p.done);
+}
+
+function listEmbed() {
+  const e = new EmbedBuilder()
+    .setColor(0x8b8b8b)
+    .setTitle("Plantaciones activas")
+    .setFooter({ text: "Maleficis • Plantaciones" });
+
+  const active = plantaciones.filter(p => !p.done);
+  if (!active.length) {
+    e.setDescription("No hay plantaciones activas.");
+    return e;
+  }
+
+  const lines = active.map(p => {
+    const tipo = p.tipo === "duplicar" ? "Duplicar" : "Cosecha";
+    let extra = "";
+    if (p.tipo === "duplicar") {
+      const rem = (p.createdAt + DUPLICATE_READY) - now();
+      extra = rem <= 0 ? "Cultivar: disponible" : `Cultivar en: ${fmtMs(rem)}`;
+    } else {
+      const w = p.nextWaterAt - now();
+      const h = p.nextHarvestAt - now();
+      extra = `Riego: ${w <= 0 ? "disponible" : fmtMs(w)} • Cosecha: ${h <= 0 ? "disponible" : fmtMs(h)} • ${p.harvestCount}/3`;
+    }
+    return `**#${p.id}** • ${tipo}${p.descripcion ? ` • ${p.descripcion}` : ""}\n${extra}`;
+  });
+
+  e.setDescription(lines.join("\n\n"));
+  return e;
+}
+
+function registroEmbedAll(filterUser) {
+  const e = new EmbedBuilder()
+    .setColor(0x222222)
+    .setTitle(filterUser ? `Registro • ${filterUser.tag}` : "Registro • Todos")
+    .setFooter({ text: "Maleficis • Registro" });
+
+  const items = filterUser
+    ? registro.filter(r => r.userId === filterUser.id)
+    : registro;
+
+  if (!items.length) {
+    e.setDescription("No hay registro todavía.");
+    return e;
+  }
+
+  // Agrupar por usuario
+  const byUser = new Map();
+  for (const r of items) {
+    if (!byUser.has(r.userId)) byUser.set(r.userId, { tag: r.userTag, rows: [] });
+    byUser.get(r.userId).rows.push(r);
+  }
+
+  // Para “todos”: mostramos resumen por usuario con últimas acciones
+  if (!filterUser) {
+    const chunks = [];
+    for (const [uid, data] of byUser.entries()) {
+      const rows = data.rows.slice(-6).reverse(); // últimas 6
+      const text = rows.map(x => `• **${fmtDate(x.ts)}** — ${x.action} (${x.details})`).join("\n");
+      chunks.push({ name: `${data.tag} (${data.rows.length})`, value: text || "—" });
+    }
+
+    // Discord embed fields límite: 25
+    for (const f of chunks.slice(0, 25)) e.addFields(f);
+
+    if (chunks.length > 25) {
+      e.addFields({ name: "Nota", value: `Mostrando 25 usuarios (hay ${chunks.length}). Filtrá con \`/registro usuario:@...\`` });
+    }
+
+    return e;
+  }
+
+  // Para usuario: lista detallada (últimos 25)
+  const rows = items.slice(-25).reverse();
+  e.setDescription(rows.map(x => `• **${fmtDate(x.ts)}** — **${x.action}** (${x.details})`).join("\n"));
+  return e;
+}
+
+// Botón para limpiar registro
+function registroControlsRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("log:clear")
+      .setLabel("Limpiar registro")
+      .setStyle(ButtonStyle.Danger)
   );
-  console.log("✅ Comandos registrados");
-})();
+}
 
-// =====================
-// READY
-// =====================
-client.once("ready", () => {
-  console.log(`🤖 Bot listo: ${client.user.tag}`);
-});
+// =========================
+// EVENTS
+// =========================
+client.once("ready", async () => {
+  console.log(`[OK] Bot listo: ${client.user.tag}`);
+  await registerCommands().catch(console.error);
+  startScheduler(client);
 
-// =====================
-// INTERACTIONS - COMMANDS
-// =====================
-client.on("interactionCreate", async (i) => {
-  if (!i.isChatInputCommand()) return;
-
-  // -------- /plantacion --------
-  if (i.commandName === "plantacion") {
-    const tipo = i.options.getString("tipo");
-    const descripcion = i.options.getString("descripcion") || "Sin descripción";
-
-    const p = {
-      id: id(),
-      tipo,
-      descripcion,
-      canalId: i.channelId,
-
-      creada: now(),
-
-      // para cosecha
-      ultimaRegada: now(),
-      ultimaCosecha: now(),
-      cosechas: 0,
-
-      // flags de aviso (para no spamear cada minuto)
-      avisoRegar: false,
-      avisoCosechar: false,
-      avisoDuplicar: false,
-    };
-
-    plantaciones.push(p);
-
-    addLog(`🆕 PLANTACIÓN | ${tipo.toUpperCase()} | "${descripcion}" | por ${i.user.tag} | ${fechaAR()}`);
-
-    // IMPORTANTE: NO botones acá
-    const embed = buildPlantEmbed(p, { footer: "Creada ✅ (los botones aparecen solo cuando toque)" });
-
-    return i.reply({
-      embeds: [embed],
-      ephemeral: false,
-    });
-  }
-
-  // -------- /plantaciones --------
-  if (i.commandName === "plantaciones") {
-    if (plantaciones.length === 0) {
-      return i.reply({ content: "📭 No hay plantaciones activas.", ephemeral: true });
-    }
-
-    const e = new EmbedBuilder()
-      .setTitle("📋 Plantaciones activas")
-      .setColor(0x6AA9FF)
-      .setFooter({ text: "Usá /borrarplantacion numero:X para eliminar una" })
-      .setTimestamp();
-
-    const t = now();
-
-    plantaciones.forEach((p, idx) => {
-      if (p.tipo === "duplicar") {
-        const falta = T_DUPLICAR - (t - p.creada);
-        e.addFields({
-          name: `#${idx + 1} — 🌿 Duplicar`,
-          value: `📝 ${p.descripcion}\n⏳ Cultivar en: **${msToHM(falta)}**`,
-        });
-      } else {
-        const faltaRegar = T_REGAR - (t - p.ultimaRegada);
-        const faltaCosechar = T_COSECHAR - (t - p.ultimaCosecha);
-        e.addFields({
-          name: `#${idx + 1} — 🌱 Cosecha`,
-          value:
-            `📝 ${p.descripcion}\n` +
-            `💧 Regar en: **${msToHM(faltaRegar)}**\n` +
-            `🌾 Cosechar en: **${msToHM(faltaCosechar)}**\n` +
-            `🌾 Cortes: **${p.cosechas}/3**`,
-        });
-      }
-    });
-
-    return i.reply({ embeds: [e], ephemeral: false });
-  }
-
-  // -------- /borrarplantacion --------
-  if (i.commandName === "borrarplantacion") {
-    const n = i.options.getInteger("numero") - 1;
-
-    if (!plantaciones[n]) {
-      return i.reply({ content: "❌ Número inválido.", ephemeral: true });
-    }
-
-    const p = plantaciones[n];
-    plantaciones.splice(n, 1);
-
-    addLog(`🗑️ PLANTACIÓN BORRADA | ${p.tipo.toUpperCase()} | "${p.descripcion}" | por ${i.user.tag} | ${fechaAR()}`);
-
-    const e = buildAlertEmbed(
-      "🗑️ Plantación eliminada",
-      `Se eliminó: **${p.descripcion}** (${p.tipo})`,
-      0xFF6B6B
-    );
-
-    return i.reply({ embeds: [e], ephemeral: false });
-  }
-
-  // -------- /registro (ADMIN) --------
-  if (i.commandName === "registro") {
-    if (!i.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-      return i.reply({ content: "❌ Solo administradores.", ephemeral: true });
-    }
-
-    if (registro.length === 0) {
-      return i.reply({ content: "📭 No hay registros.", ephemeral: true });
-    }
-
-    const lines = registro.slice(-120); // últimas 120 entradas
-
-    const e = new EmbedBuilder()
-      .setTitle("📜 Registro completo")
-      .setColor(0xFFD166)
-      .setDescription(lines.join("\n"))
-      .setFooter({ text: `Mostrando las últimas ${lines.length} entradas` })
-      .setTimestamp();
-
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId("reg_clear")
-        .setLabel("🗑️ Borrar registro")
-        .setStyle(ButtonStyle.Danger)
-    );
-
-    return i.reply({ embeds: [e], components: [row], ephemeral: false });
-  }
-
-  // -------- /chester --------
-  if (i.commandName === "chester") {
-    const e = new EmbedBuilder()
-      .setTitle("🧰 Chester — Trabajos (CD 24h)")
-      .setDescription("Tocá un trabajo para iniciar el cooldown. Cuando esté listo, te taggeo solo a vos.")
-      .setColor(0x8A6CFF)
-      .setFooter({ text: "Cooldown por usuario y por trabajo" })
-      .setTimestamp();
-
-    const row1 = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("ch_molotov").setLabel("molotov").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("ch_parking").setLabel("parking").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("ch_ventanillas").setLabel("ventanillas").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("ch_ruedas").setLabel("ruedas").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("ch_grafitis").setLabel("grafitis").setStyle(ButtonStyle.Secondary),
-    );
-
-    const row2 = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("ch_peleas").setLabel("peleas").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("ch_transporte").setLabel("transporte").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("ch_coche").setLabel("coche").setStyle(ButtonStyle.Secondary),
-    );
-
-    return i.reply({ embeds: [e], components: [row1, row2], ephemeral: false });
-  }
-
-  // -------- /tienda --------
-  if (i.commandName === "tienda") {
-    const modo = i.options.getString("modo"); // solo/grupo
-    const t = now();
-
-    let task = tiendaTasks.find(x => x.userId === i.user.id);
-
-    // Si está activo el CD
-    if (task && task.dueAt > t) {
-      const falta = task.dueAt - t;
-      const e = buildAlertEmbed(
-        "🏪 Tienda en cooldown",
-        `⏳ Te falta **${msToHM(falta)}** para poder robar tienda de nuevo.`,
-        0xFFB703
-      );
-      return i.reply({ embeds: [e], ephemeral: true });
-    }
-
-    const dur = (modo === "grupo") ? T_TIENDA_GRUPO : T_TIENDA_SOLO;
-    const dueAt = t + dur;
-
-    if (!task) {
-      task = { userId: i.user.id, userTag: i.user.tag, mode: modo, channelId: i.channelId, dueAt, notified: false };
-      tiendaTasks.push(task);
-    } else {
-      task.mode = modo;
-      task.channelId = i.channelId;
-      task.dueAt = dueAt;
-      task.notified = false;
-    }
-
-    addLog(`🏪 TIENDA START | modo=${modo.toUpperCase()} | por ${i.user.tag} | ${fechaAR()}`);
-
-    const e = new EmbedBuilder()
-      .setTitle("🏪 Tienda iniciada")
-      .setColor(0x06D6A0)
-      .setDescription(
-        `✅ Listo, **${modo}**.\n` +
-        `Te aviso cuando puedas hacerlo de nuevo.\n` +
-        `⏳ Cooldown: **${msToHM(dur)}**`
-      )
-      .setTimestamp();
-
-    return i.reply({ embeds: [e], ephemeral: true });
+  // al arrancar, refresca embeds (por si quedó desincronizado)
+  for (const p of plantaciones.filter(x => !x.done)) {
+    updatePlantEmbed(client, p).catch(() => null);
   }
 });
 
-// =====================
-// INTERACTIONS - BUTTONS
-// =====================
-client.on("interactionCreate", async (i) => {
-  if (!i.isButton()) return;
+// Slash commands
+client.on("interactionCreate", async (interaction) => {
+  try {
+    if (interaction.isChatInputCommand()) {
+      const { commandName } = interaction;
 
-  // -------- limpiar registro (ADMIN) --------
-  if (i.customId === "reg_clear") {
-    if (!i.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-      return i.reply({ content: "❌ Solo administradores.", ephemeral: true });
-    }
-    registro = [];
-    return i.update({ content: "🗑️ Registro eliminado.", embeds: [], components: [] });
-  }
+      if (commandName === "plantacion") {
+        const tipo = interaction.options.getString("tipo", true);
+        const descripcion = interaction.options.getString("descripcion") || "";
+        const canalEmbed = interaction.options.getChannel("canal_embed") || interaction.channel;
+        const canalAlertas = interaction.options.getChannel("canal_alertas") || interaction.channel;
+        const imagen = interaction.options.getAttachment("imagen");
 
-  // -------- Chester buttons --------
-  if (i.customId.startsWith("ch_")) {
-    const job = i.customId.replace("ch_", "").trim();
-    if (!CHESTER_JOBS.includes(job)) return i.reply({ content: "❌ Trabajo inválido.", ephemeral: true });
+        if (!canalEmbed || canalEmbed.type !== ChannelType.GuildText) {
+          return interaction.reply({ content: "Ese canal de embed no es válido.", ephemeral: true });
+        }
+        if (!canalAlertas || canalAlertas.type !== ChannelType.GuildText) {
+          return interaction.reply({ content: "Ese canal de alertas no es válido.", ephemeral: true });
+        }
 
-    const t = now();
-    let task = chesterTasks.find(x => x.userId === i.user.id && x.job === job);
+        const p = {
+          id: nextPlantId(),
+          tipo,
+          descripcion,
+          imageUrl: imagen?.url || null,
+          createdBy: interaction.user.id,
+          createdAt: now(),
+          embedChannelId: canalEmbed.id,
+          embedMessageId: null,
+          notifyChannelId: canalAlertas.id,
+          nextWaterAt: tipo === "cosecha" ? now() + WATER_INTERVAL : null,
+          nextHarvestAt: tipo === "cosecha" ? now() + HARVEST_INTERVAL : null,
+          harvestCount: 0,
+          done: false,
+          lastAlertMessageId: null,
+        };
 
-    if (task && task.dueAt > t) {
-      const falta = task.dueAt - t;
-      const e = buildAlertEmbed("🧰 Chester", `⏳ Te falta **${msToHM(falta)}** para **${job}**.`, 0x9B5DE5);
-      return i.reply({ embeds: [e], ephemeral: true });
-    }
+        // crea embed fijo
+        const embed = buildPlantEmbed(p);
+        const msg = await canalEmbed.send({ embeds: [embed] });
 
-    if (!task) {
-      task = { userId: i.user.id, userTag: i.user.tag, job, channelId: i.channelId, dueAt: t + T_CHESTER, notified: false };
-      chesterTasks.push(task);
-    } else {
-      task.channelId = i.channelId;
-      task.dueAt = t + T_CHESTER;
-      task.notified = false;
-    }
+        p.embedMessageId = msg.id;
+        plantaciones.push(p);
+        saveJSON(PLANTS_FILE, plantaciones);
 
-    addLog(`🧰 CHESTER START | ${job} | por ${i.user.tag} | ${fechaAR()}`);
+        addLog(interaction.user, "Creó plantación", `#${p.id} • ${tipo}${descripcion ? " • " + descripcion : ""}`);
 
-    const e = new EmbedBuilder()
-      .setTitle("🧰 Chester — Cooldown iniciado")
-      .setColor(0x8A6CFF)
-      .setDescription(`✅ Trabajo: **${job}**\n⏳ Te aviso en **24 horas**.`)
-      .setTimestamp();
+        await interaction.reply({
+          content: `✅ Plantación **#${p.id}** creada. Embed: <#${canalEmbed.id}> • Alertas: <#${canalAlertas.id}>`,
+          ephemeral: true
+        });
 
-    return i.reply({ embeds: [e], ephemeral: true });
-  }
-
-  // -------- Plantación: regar / cosechar / cultivar --------
-  if (i.customId.startsWith("pl_")) {
-    const parts = i.customId.split("_"); // pl_{action}_{id}
-    const action = parts[1];
-    const pid = parts.slice(2).join("_");
-
-    const p = plantaciones.find(x => x.id === pid);
-    if (!p) return i.reply({ content: "❌ Esa plantación ya no existe.", ephemeral: true });
-
-    const t = now();
-
-    // Cultivar (duplicar) -> elimina
-    if (action === "cultivar") {
-      if (p.tipo !== "duplicar") return i.reply({ content: "❌ Acción inválida.", ephemeral: true });
-
-      plantaciones = plantaciones.filter(x => x.id !== p.id);
-      addLog(`🌿 CULTIVADA (DUPLICAR) | "${p.descripcion}" | por ${i.user.tag} | ${fechaAR()}`);
-
-      const e = new EmbedBuilder()
-        .setTitle("🌿 Cultivo realizado")
-        .setColor(0x7CFF6B)
-        .setDescription(`✅ **${i.user.tag}** cultivó: **${p.descripcion}**\n🧾 La plantación fue eliminada.`)
-        .setTimestamp();
-
-      // editamos el mensaje del aviso para quitar el botón
-      try { await i.update({ embeds: [e], components: [] }); } catch { /* ignore */ }
-      return;
-    }
-
-    // Regar
-    if (action === "regar") {
-      if (p.tipo !== "cosecha") return i.reply({ content: "❌ Acción inválida.", ephemeral: true });
-
-      p.ultimaRegada = t;
-      p.avisoRegar = false;
-
-      addLog(`💧 REGADA | "${p.descripcion}" | por ${i.user.tag} | ${fechaAR()}`);
-
-      const e = new EmbedBuilder()
-        .setTitle("💧 Riego registrado")
-        .setColor(0x4CC9F0)
-        .setDescription(`✅ **${i.user.tag}** regó: **${p.descripcion}**`)
-        .addFields({ name: "Próximo riego", value: `En **${msToHM(T_REGAR)}**`, inline: true })
-        .setTimestamp();
-
-      try { await i.update({ embeds: [e], components: [] }); } catch { /* ignore */ }
-      return;
-    }
-
-    // Cosechar
-    if (action === "cosechar") {
-      if (p.tipo !== "cosecha") return i.reply({ content: "❌ Acción inválida.", ephemeral: true });
-
-      p.ultimaCosecha = t;
-      p.avisoCosechar = false;
-      p.cosechas++;
-
-      addLog(`🌾 COSECHADA | "${p.descripcion}" | por ${i.user.tag} | ${fechaAR()} (${p.cosechas}/3)`);
-
-      if (p.cosechas >= 3) {
-        plantaciones = plantaciones.filter(x => x.id !== p.id);
-        addLog(`❌ PLANTA DESAPARECE | "${p.descripcion}" | auto (3/3) | ${fechaAR()}`);
-
-        const e = new EmbedBuilder()
-          .setTitle("🌾 Cosecha final (3/3)")
-          .setColor(0xFF6B6B)
-          .setDescription(`✅ **${i.user.tag}** hizo la **3ª cosecha** de: **${p.descripcion}**\n🧾 La planta desapareció.`)
-          .setTimestamp();
-
-        try { await i.update({ embeds: [e], components: [] }); } catch { /* ignore */ }
         return;
       }
 
-      const e = new EmbedBuilder()
-        .setTitle("🌾 Cosecha registrada")
-        .setColor(0xF4A261)
-        .setDescription(`✅ **${i.user.tag}** cosechó: **${p.descripcion}**`)
-        .addFields(
-          { name: "Cortes", value: `**${p.cosechas}/3**`, inline: true },
-          { name: "Próxima cosecha", value: `En **${msToHM(T_COSECHAR)}**`, inline: true }
-        )
-        .setTimestamp();
+      if (commandName === "plantaciones") {
+        return interaction.reply({ embeds: [listEmbed()], ephemeral: true });
+      }
 
-      try { await i.update({ embeds: [e], components: [] }); } catch { /* ignore */ }
-      return;
+      if (commandName === "borrarplantacion") {
+        if (!isAdmin(interaction)) {
+          return interaction.reply({ content: "No tenés permisos.", ephemeral: true });
+        }
+        const numero = interaction.options.getInteger("numero", true);
+        const idx = plantaciones.findIndex(p => p.id === numero && !p.done);
+        if (idx === -1) {
+          return interaction.reply({ content: "No existe esa plantación activa.", ephemeral: true });
+        }
+        const p = plantaciones[idx];
+
+        await deletePlantEmbed(client, p);
+        plantaciones[idx].done = true;
+        saveJSON(PLANTS_FILE, plantaciones);
+
+        addLog(interaction.user, "Borró plantación", `#${p.id}`);
+
+        return interaction.reply({ content: `🗑️ Plantación #${p.id} eliminada.`, ephemeral: true });
+      }
+
+      if (commandName === "registro") {
+        if (!isAdmin(interaction)) {
+          return interaction.reply({ content: "No tenés permisos.", ephemeral: true });
+        }
+        const u = interaction.options.getUser("usuario");
+        const emb = registroEmbedAll(u);
+
+        return interaction.reply({
+          embeds: [emb],
+          components: [registroControlsRow()],
+          ephemeral: true
+        });
+      }
+    }
+
+    // Buttons
+    if (interaction.isButton()) {
+      const [scope, action, idStr] = interaction.customId.split(":");
+
+      // Limpiar registro
+      if (interaction.customId === "log:clear") {
+        if (!isAdmin(interaction)) {
+          return interaction.reply({ content: "No tenés permisos para limpiar el registro.", ephemeral: true });
+        }
+        registro = [];
+        saveJSON(LOG_FILE, registro);
+        return interaction.reply({ content: "🧹 Registro limpiado.", ephemeral: true });
+      }
+
+      if (scope !== "plant") return;
+
+      const plantId = parseInt(idStr, 10);
+      const p = findPlantById(plantId);
+      if (!p) {
+        return interaction.reply({ content: "Esa plantación ya no existe o fue finalizada.", ephemeral: true });
+      }
+
+      // Evitar doble click simultáneo: deshabilitamos botones del mensaje
+      await interaction.deferUpdate().catch(() => null);
+
+      if (p.tipo === "duplicar") {
+        // Solo “harvest” (cultivar)
+        if (action !== "harvest") {
+          return interaction.followUp({ content: "Esta plantación es de duplicar: solo se puede cultivar.", ephemeral: true });
+        }
+
+        const readyAt = p.createdAt + DUPLICATE_READY;
+        if (now() < readyAt) {
+          return interaction.followUp({ content: "Todavía no está lista para cultivar.", ephemeral: true });
+        }
+
+        addLog(interaction.user, "Cultivó", `Plantación #${p.id}${p.descripcion ? " • " + p.descripcion : ""}`);
+
+        // Finaliza y borra embed + alerta
+        p.done = true;
+        saveJSON(PLANTS_FILE, plantaciones);
+        await deletePlantEmbed(client, p);
+
+        // Aviso corto “confirmación” sin spam
+        return interaction.followUp({ content: `✅ Cultivo registrado en **Plantación #${p.id}**.`, ephemeral: true });
+      }
+
+      // Cosecha
+      if (p.tipo === "cosecha") {
+        if (action === "water") {
+          if (now() < p.nextWaterAt) {
+            return interaction.followUp({ content: "Todavía no toca regar.", ephemeral: true });
+          }
+
+          p.nextWaterAt = now() + WATER_INTERVAL;
+          saveJSON(PLANTS_FILE, plantaciones);
+
+          addLog(interaction.user, "Regó", `Plantación #${p.id}${p.descripcion ? " • " + p.descripcion : ""}`);
+
+          // Actualiza embed
+          await updatePlantEmbed(client, p);
+
+          // Borra el mensaje de alerta (limpio)
+          // (al responder no necesitamos mantener el aviso)
+          if (p.lastAlertMessageId) {
+            const chId = p.notifyChannelId || p.embedChannelId;
+            const ch = await client.channels.fetch(chId).catch(() => null);
+            if (ch && ch.type === ChannelType.GuildText) {
+              const old = await ch.messages.fetch(p.lastAlertMessageId).catch(() => null);
+              if (old) await old.delete().catch(() => null);
+            }
+            p.lastAlertMessageId = null;
+            saveJSON(PLANTS_FILE, plantaciones);
+          }
+
+          return interaction.followUp({ content: `💧 Riego registrado en **Plantación #${p.id}**.`, ephemeral: true });
+        }
+
+        if (action === "harvest") {
+          if (now() < p.nextHarvestAt) {
+            return interaction.followUp({ content: "Todavía no toca cosechar.", ephemeral: true });
+          }
+
+          p.harvestCount += 1;
+          p.nextHarvestAt = now() + HARVEST_INTERVAL;
+          saveJSON(PLANTS_FILE, plantaciones);
+
+          addLog(interaction.user, "Cosechó", `Plantación #${p.id} • ${p.harvestCount}/3${p.descripcion ? " • " + p.descripcion : ""}`);
+
+          // Si llegó a 3, finaliza
+          if (p.harvestCount >= 3) {
+            p.done = true;
+            saveJSON(PLANTS_FILE, plantaciones);
+            await deletePlantEmbed(client, p);
+
+            return interaction.followUp({ content: `🌿 Cosecha **3/3** registrada. Plantación #${p.id} finalizada y eliminada.`, ephemeral: true });
+          }
+
+          // Si no, update embed
+          await updatePlantEmbed(client, p);
+
+          // limpia alerta
+          if (p.lastAlertMessageId) {
+            const chId = p.notifyChannelId || p.embedChannelId;
+            const ch = await client.channels.fetch(chId).catch(() => null);
+            if (ch && ch.type === ChannelType.GuildText) {
+              const old = await ch.messages.fetch(p.lastAlertMessageId).catch(() => null);
+              if (old) await old.delete().catch(() => null);
+            }
+            p.lastAlertMessageId = null;
+            saveJSON(PLANTS_FILE, plantaciones);
+          }
+
+          return interaction.followUp({ content: `🌿 Cosecha registrada en **Plantación #${p.id}** (${p.harvestCount}/3).`, ephemeral: true });
+        }
+      }
+
+      return interaction.followUp({ content: "Acción no válida.", ephemeral: true });
+    }
+  } catch (e) {
+    console.error("[ERR] interactionCreate", e);
+    if (interaction.isRepliable()) {
+      try {
+        await interaction.reply({ content: "Ocurrió un error. Revisá Logs.", ephemeral: true });
+      } catch {}
     }
   }
 });
 
-// =====================
-// LOOP: ALERTAS + RESETS
-// =====================
-setInterval(async () => {
-  const t = now();
+// =========================
+// START
+// =========================
+client.login(TOKEN).catch((e) => {
+  console.error("[FATAL] Login falló:", e);
+  process.exit(1);
+});
 
-  // ---- Reset CD tienda por horarios AR (simula reinicios) ----
-  const hm = hmAR(); // "HH:MM"
-  if (TIENDA_RESETS.has(hm)) {
-    const key = `${hm}_${new Date().toLocaleDateString("es-AR", { timeZone: TZ })}`;
-    if (lastTiendaResetKey !== key) {
-      lastTiendaResetKey = key;
-      if (tiendaTasks.length > 0) {
-        tiendaTasks = [];
-        addLog(`♻️ RESET TIENDA | Limpieza automática por horario (${hm} AR) | ${fechaAR()}`);
-      }
-    }
-  }
-
-  // ---- Plantaciones ----
-  for (const p of plantaciones) {
-    let canal;
-    try {
-      canal = await client.channels.fetch(p.canalId);
-    } catch {
-      continue;
-    }
-
-    // Duplicar -> aviso a las 3h con botón cultivar
-    if (p.tipo === "duplicar") {
-      if (!p.avisoDuplicar && (t - p.creada) >= T_DUPLICAR) {
-        p.avisoDuplicar = true;
-
-        const embed = buildAlertEmbed(
-          "🌿 ¡Listo para cultivar!",
-          `**${p.descripcion}**\n\n👉 Tocá el botón para registrar quién lo hizo y eliminar la plantación.`,
-          0x7CFF6B
-        );
-
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId(`pl_cultivar_${p.id}`)
-            .setLabel("🌿 Cultivar")
-            .setStyle(ButtonStyle.Success)
-        );
-
-        canal.send({
-          content: `${PLANT_PING} 🌿 **Duplicar listo:** ${p.descripcion}`,
-          embeds: [embed],
-          components: [row],
-        });
-
-        addLog(`🌿 DUPLICAR LISTO | "${p.descripcion}" | aviso enviado | ${fechaAR()}`);
-      }
-      continue;
-    }
-
-    // Cosecha -> aviso regar
-    if (p.tipo === "cosecha") {
-      if (!p.avisoRegar && (t - p.ultimaRegada) >= T_REGAR) {
-        p.avisoRegar = true;
-
-        const embed = buildAlertEmbed(
-          "💧 ¡Hay que regar!",
-          `**${p.descripcion}**\n\n⏳ Último riego: ${msToHM(t - p.ultimaRegada)} atrás`,
-          0x4CC9F0
-        );
-
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId(`pl_regar_${p.id}`)
-            .setLabel("💧 Regar")
-            .setStyle(ButtonStyle.Primary)
-        );
-
-        canal.send({
-          content: `${PLANT_PING} 💧 **Regar:** ${p.descripcion}`,
-          embeds: [embed],
-          components: [row],
-        });
-
-        addLog(`💧 AVISO REGAR | "${p.descripcion}" | enviado | ${fechaAR()}`);
-      }
-
-      // Cosecha -> aviso cosechar
-      if (!p.avisoCosechar && (t - p.ultimaCosecha) >= T_COSECHAR) {
-        p.avisoCosechar = true;
-
-        const embed = buildAlertEmbed(
-          "🌾 ¡Hay que cosechar!",
-          `**${p.descripcion}**\n\n🌾 Cortes actuales: **${p.cosechas}/3**`,
-          0xF4A261
-        );
-
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId(`pl_cosechar_${p.id}`)
-            .setLabel("🌾 Cosechar")
-            .setStyle(ButtonStyle.Success)
-        );
-
-        canal.send({
-          content: `${PLANT_PING} 🌾 **Cosechar:** ${p.descripcion}`,
-          embeds: [embed],
-          components: [row],
-        });
-
-        addLog(`🌾 AVISO COSECHAR | "${p.descripcion}" | enviado | ${fechaAR()}`);
-      }
-    }
-  }
-
-  // ---- Chester: avisos al usuario cuando se cumple ----
-  for (const task of chesterTasks) {
-    if (!task.notified && t >= task.dueAt) {
-      task.notified = true;
-      let canal;
-      try {
-        canal = await client.channels.fetch(task.channelId);
-      } catch {
-        continue;
-      }
-
-      const e = new EmbedBuilder()
-        .setTitle("🧰 Chester — Listo")
-        .setColor(0x8A6CFF)
-        .setDescription(`✅ <@${task.userId}> ya podés hacer de nuevo: **${task.job}**`)
-        .setTimestamp();
-
-      canal.send({ content: `<@${task.userId}>`, embeds: [e] });
-      addLog(`🧰 CHESTER READY | ${task.job} | para ${task.userTag} | ${fechaAR()}`);
-    }
-  }
-
-  // ---- Tienda: avisos al usuario cuando se cumple ----
-  for (const task of tiendaTasks) {
-    if (!task.notified && t >= task.dueAt) {
-      task.notified = true;
-      let canal;
-      try {
-        canal = await client.channels.fetch(task.channelId);
-      } catch {
-        continue;
-      }
-
-      const e = new EmbedBuilder()
-        .setTitle("🏪 Tienda — Cooldown terminado")
-        .setColor(0x06D6A0)
-        .setDescription(`✅ <@${task.userId}> ya podés robar tienda de nuevo.`)
-        .addFields({ name: "Modo anterior", value: task.mode.toUpperCase(), inline: true })
-        .setTimestamp();
-
-      canal.send({ content: `<@${task.userId}>`, embeds: [e] });
-      addLog(`🏪 TIENDA READY | modo=${task.mode.toUpperCase()} | para ${task.userTag} | ${fechaAR()}`);
-    }
-  }
-}, 60 * 1000);
-
-// =====================
-// LOGIN
-// =====================
-client.login(process.env.TOKEN);
