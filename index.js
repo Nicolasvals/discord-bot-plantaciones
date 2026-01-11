@@ -24,19 +24,10 @@ const TOKEN = process.env.TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
 
-// Role ping (recomendado setear el ID en Railway)
-const MARIHUANA_ROLE_ID = process.env.MARIHUANA_ROLE_ID || "";
-function pingMarihuana() {
-  // Si tenés el ID y el rol es mentionable, esto pingeo real
-  if (MARIHUANA_ROLE_ID && /^\d+$/.test(MARIHUANA_ROLE_ID)) return `<@&${MARIHUANA_ROLE_ID}>`;
-  // fallback (puede pinguear si el rol existe y es mentionable)
-  return "@marihuana";
-}
-
 // Plantaciones
-const DUPLICAR_MS = 3 * 60 * 60 * 1000;       // 3h
-const REGAR_MS = (2 * 60 + 30) * 60 * 1000;   // 2h 30m ✅
-const COSECHAR_MS = 3 * 60 * 60 * 1000;       // 3h ✅
+const DUPLICAR_MS = 3 * 60 * 60 * 1000;        // 3h
+const REGAR_MS    = (2 * 60 + 30) * 60 * 1000; // 2h 30m
+const COSECHAR_MS = 3 * 60 * 60 * 1000;        // 3h
 const MAX_COSECHAS = 3;
 
 // Chester
@@ -47,7 +38,7 @@ const CHESTER_JOBS = [
   "ruedas",
   "grafitis",
   "peleas",
-  "transporte",
+  "moto",        // ✅ antes "transporte"
   "coche",
 ];
 const CHESTER_CD_MS = 24 * 60 * 60 * 1000; // 24h
@@ -59,9 +50,12 @@ const TIENDA_CD_GRUPO_MS = 2 * 60 * 60 * 1000; // 2h
 // Reinicios ARG: 00:00 / 08:00 / 16:00
 const RESET_HOURS = [0, 8, 16]; // usar TZ=America/Argentina/Buenos_Aires en Railway
 
-// Tramportista (1 vez por reinicio)
+// Tramportista
 const TRAMPORTISTA_IMAGE =
   "https://static.wikia.nocookie.net/esgta/images/2/2f/YankeeviejoGTAV.jpg/revision/latest?cb=20141205120106";
+
+// Rol a pinguear por nombre (exacto)
+const PING_ROLE_NAME = "marihuana";
 
 // =====================
 // SIMPLE FILE DB
@@ -85,12 +79,10 @@ function saveJSON(file, data) {
 
 const DB = {
   plantaciones: loadJSON("plantaciones.json", []),
-  chester: loadJSON("chester.json", {}),
+  chester: loadJSON("chester.json", {}), // { userId: { job: nextTs, job_notifiedTs: nextTs } }
+  chesterPanels: loadJSON("chester_panels.json", {}), // { userId: { channelId, messageId } }
   tienda: loadJSON("tienda.json", {}),
-  tramportista: loadJSON("tramportista.json", {
-    resetKey: null, // "YYYY-MM-DD|HH"
-    done: {},       // { userId: true }
-  }),
+  tramportista: loadJSON("tramportista.json", { resetKey: null, done: {} }),
   registro: loadJSON("registro.json", []),
 };
 
@@ -111,6 +103,11 @@ function fmtTipo(tipo) {
 function capFirst(s) {
   if (!s) return s;
   return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+function niceJob(job) {
+  if (job === "moto") return "Moto";
+  return capFirst(job);
 }
 
 function nextPlantId() {
@@ -146,16 +143,39 @@ async function safeFetchMessage(channel, messageId) {
 // =====================
 // DISCORD CLIENT
 // =====================
-// ⚠️ GuildMembers es privilegiado. Si lo activaste en el portal, dejalo.
-// Si NO, y no usás listas por miembros, podés sacarlo.
+// ✅ Sin GuildMembers para evitar "Used disallowed intents" si no lo tenés habilitado.
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildMembers,
-  ],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
   partials: [Partials.Channel],
 });
+
+// =====================
+// ROLE PING (por ID real)
+// =====================
+async function getRoleMentionForGuild(guild) {
+  if (!guild) return { content: `@${PING_ROLE_NAME}`, allowedMentions: { parse: [] } };
+
+  try {
+    if (!guild.roles.cache?.size) {
+      await guild.roles.fetch().catch(() => {});
+    }
+
+    const role = guild.roles.cache.find(
+      r => (r.name || "").toLowerCase() === PING_ROLE_NAME.toLowerCase()
+    );
+
+    if (!role) {
+      return { content: `@${PING_ROLE_NAME}`, allowedMentions: { parse: [] } };
+    }
+
+    return {
+      content: `<@&${role.id}>`,
+      allowedMentions: { roles: [role.id], users: [], repliedUser: false },
+    };
+  } catch {
+    return { content: `@${PING_ROLE_NAME}`, allowedMentions: { parse: [] } };
+  }
+}
 
 // =====================
 // SLASH COMMANDS
@@ -224,11 +244,6 @@ const commands = [
     .setDescription("🚚 Marca que hiciste el Tramportista (1 vez por reinicio 00/08/16)"),
 
   new SlashCommandBuilder()
-    .setName("tramportista_lista")
-    .setDescription("ADMIN: ver quién hizo y quién no el Tramportista en este reinicio")
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
-
-  new SlashCommandBuilder()
     .setName("registro")
     .setDescription("Ver registro completo (ADMIN)")
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
@@ -237,44 +252,8 @@ const commands = [
         .setDescription("Filtrar por usuario")
         .setRequired(false)
     ),
-
-  new SlashCommandBuilder()
-    .setName("resetmiscd")
-    .setDescription("Resetea TUS cooldowns personales (tienda/chester/todo)")
-    .addStringOption(opt =>
-      opt.setName("tipo")
-        .setDescription("Qué querés resetear")
-        .setRequired(true)
-        .addChoices(
-          { name: "Tienda", value: "tienda" },
-          { name: "Chester", value: "chester" },
-          { name: "Todo", value: "todo" },
-        )
-    ),
-
-  new SlashCommandBuilder()
-    .setName("resetcd")
-    .setDescription("ADMIN: Resetea cooldowns de un usuario o de todos")
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addStringOption(opt =>
-      opt.setName("tipo")
-        .setDescription("Qué querés resetear")
-        .setRequired(true)
-        .addChoices(
-          { name: "Tienda", value: "tienda" },
-          { name: "Chester", value: "chester" },
-          { name: "Todo", value: "todo" },
-        )
-    )
-    .addUserOption(opt =>
-      opt.setName("usuario")
-        .setDescription("Usuario a resetear (si lo dejás vacío, resetea A TODOS)")
-        .setRequired(false)
-    ),
-
 ].map(c => c.toJSON());
 
-// Register commands on start
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(TOKEN);
   await rest.put(
@@ -285,7 +264,7 @@ async function registerCommands() {
 }
 
 // =====================
-// EMBEDS (plantación normal / completada)
+// EMBEDS
 // =====================
 function plantCompletedEmbed(p) {
   const created = p.createdAt ?? now();
@@ -304,14 +283,22 @@ function plantCompletedEmbed(p) {
     ? p.descripcion.trim()
     : "Sin descripción.";
 
-  // sin toston: 3 líneas cortas
-  e.setDescription(
-    `📌 **${fmtTipo(p.tipo)}** — ${desc}\n` +
-    `🌱 **Plantó:** ${plantedBy}\n` +
-    `💧 **Regó:** ${waterCount} • 🧺 **Cosechó:** ${harvestCount}`
-  );
+  let lines = [];
+  lines.push(`📌 **${fmtTipo(p.tipo)}** — ${desc}`);
+  lines.push(`🌱 **Plantó:** ${plantedBy}`);
 
-  if (p.imageUrl) e.setImage(p.imageUrl);
+  // si no regó y no cosechó nadie, no lo muestres
+  if (waterCount > 0 || harvestCount > 0) {
+    lines.push(`💧 **Regó:** ${waterCount} • 🧺 **Cosechó:** ${harvestCount}`);
+  }
+
+  e.setDescription(lines.join("\n"));
+
+  // si es duplicar, NO mostrar foto al terminar
+  if (p.tipo !== "duplicar" && p.imageUrl) {
+    e.setImage(p.imageUrl);
+  }
+
   return e;
 }
 
@@ -361,9 +348,9 @@ function chesterEmbed(userId) {
   const e = new EmbedBuilder()
     .setTitle("🧰 Chester • Trabajos")
     .setDescription(
-      `👤 Panel de: <@${userId}>\n` +
-      `✅ Tocá el trabajo que hiciste y te aviso cuando vuelva.\n` +
-      `🔒 Solo el dueño del panel puede apretar los botones.`
+      `👤 **Panel de:** <@${userId}>\n` +
+      `✅ Marcá lo que hiciste y te aviso cuando vuelva.\n` +
+      `🔒 **Solo el dueño** puede apretar los botones.`
     )
     .setColor(0x9b59b6)
     .setFooter({ text: "Maleficis • Chester" });
@@ -371,7 +358,7 @@ function chesterEmbed(userId) {
   const lines = CHESTER_JOBS.map(job => {
     const nextTs = DB.chester?.[userId]?.[job] || 0;
     const available = now() >= nextTs;
-    const nice = capFirst(job);
+    const nice = niceJob(job);
     return available
       ? `✅ **${nice}** — Disponible`
       : `⏳ **${nice}** — ${relTs(nextTs)}`;
@@ -398,7 +385,7 @@ function tiendaEmbed(userId, modo, nombre, nextTs) {
 }
 
 function tramportistaEmbed(userId, resetKey) {
-  const e = new EmbedBuilder()
+  return new EmbedBuilder()
     .setTitle("🚚 Tramportista • Registrado")
     .setDescription(
       `👤 **Hecho por:** <@${userId}>\n` +
@@ -409,7 +396,6 @@ function tramportistaEmbed(userId, resetKey) {
     .setFooter({ text: "Maleficis • Tramportista" })
     .setImage(TRAMPORTISTA_IMAGE)
     .setTimestamp(new Date(now()));
-  return e;
 }
 
 // =====================
@@ -424,7 +410,7 @@ function chesterButtons(userId) {
     const nextTs = DB.chester?.[userId]?.[job] || 0;
     const available = now() >= nextTs;
 
-    const nice = capFirst(job);
+    const nice = niceJob(job);
     const label = available ? `✅ ${nice}` : `⏳ ${nice}`;
 
     const btn = new ButtonBuilder()
@@ -446,42 +432,64 @@ function chesterButtons(userId) {
   return rows;
 }
 
-function registroButtons() {
-  return [
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId("registro_borrar")
-        .setLabel("🗑️ Borrar registro")
-        .setStyle(ButtonStyle.Danger)
-    )
-  ];
+// =====================
+// ALERT MESSAGE CLEANUP
+// =====================
+async function cleanupAlertMessage(msg) {
+  if (!msg) return;
+  try {
+    await msg.delete();
+    return;
+  } catch {
+    try {
+      await msg.edit({ content: "✅ Listo.", embeds: [], components: [] });
+    } catch {}
+  }
 }
 
 // =====================
-// ALERTS / SCHEDULERS
+// PLANT MAIN MESSAGE (NO DUPLICADOS)
 // =====================
 async function ensurePlantMessage(p) {
   const ch = await safeFetchChannel(client, p.channelId);
   if (!ch) return;
 
-  let msg = null;
-  if (p.messageId) msg = await safeFetchMessage(ch, p.messageId);
+  if (p.messageId) {
+    const msg = await safeFetchMessage(ch, p.messageId);
+    if (!msg) return; // evita duplicados si no se puede fetchear
+
+    const embed = plantEmbed(p);
+    await msg.edit({ embeds: [embed], components: [] }).catch(() => {});
+    return;
+  }
 
   const embed = plantEmbed(p);
-
-  if (msg) {
-    await msg.edit({ embeds: [embed], components: [] }).catch(() => {});
-  } else {
-    const sent = await ch.send({ embeds: [embed] }).catch(() => null);
-    if (sent) updatePlant({ id: p.id, messageId: sent.id });
-  }
+  const sent = await ch.send({ embeds: [embed] }).catch(() => null);
+  if (sent) updatePlant({ id: p.id, messageId: sent.id });
 }
 
-async function deleteMessageSafe(msg) {
-  try { if (msg && msg.deletable) await msg.delete(); } catch {}
+// =====================
+// CHESTER PANEL UPDATE (AUTO)
+// =====================
+async function refreshChesterPanel(userId) {
+  const panel = DB.chesterPanels?.[userId];
+  if (!panel?.channelId || !panel?.messageId) return;
+
+  const ch = await safeFetchChannel(client, panel.channelId);
+  if (!ch) return;
+
+  const msg = await safeFetchMessage(ch, panel.messageId);
+  if (!msg) return;
+
+  await msg.edit({
+    embeds: [chesterEmbed(userId)],
+    components: chesterButtons(userId),
+  }).catch(() => {});
 }
 
-// Send alert when time reached (buttons appear ONLY here)
+// =====================
+// ALERT SENDER
+// =====================
 async function sendPlantAlert(p, kind) {
   const ch = await safeFetchChannel(client, p.channelId);
   if (!ch) return;
@@ -519,26 +527,31 @@ async function sendPlantAlert(p, kind) {
     rows.push(row);
   }
 
-  const ping = pingMarihuana();
-  const title =
+  const pingInfo = await getRoleMentionForGuild(ch.guild);
+  const baseTitle =
     p.tipo === "duplicar"
-      ? `🌿 ${ping} Plantación #${p.id} lista para **cultivar**`
+      ? `🌿 Plantación #${p.id} lista para **cultivar**`
       : (kind === "regar"
-        ? `💧 ${ping} Plantación #${p.id} necesita **riego**`
-        : `🧺 ${ping} Plantación #${p.id} lista para **cosechar**`);
+        ? `💧 Plantación #${p.id} necesita **riego**`
+        : `🧺 Plantación #${p.id} lista para **cosechar**`);
 
-  await ch.send({ content: title, embeds: [embed], components: rows }).catch(() => {});
+  await ch.send({
+    content: `${pingInfo.content} ${baseTitle}`,
+    allowedMentions: pingInfo.allowedMentions,
+    embeds: [embed],
+    components: rows
+  }).catch(() => {});
 }
 
 // =====================
-// FIX: no iterar *_notified como cooldown
+// UTILS
 // =====================
 function isNotifiedKey(k) {
-  return typeof k === "string" && k.endsWith("_notified");
+  return typeof k === "string" && (k.endsWith("_notified") || k.endsWith("_notifiedTs"));
 }
 
 // =====================
-// TRAMPORTISTA: resetKey por "ventana de reinicio"
+// TRAMPORTISTA WINDOWS
 // =====================
 function makeKey(d) {
   const yyyy = d.getFullYear();
@@ -549,7 +562,6 @@ function makeKey(d) {
 }
 
 function getCurrentResetWindowKey() {
-  // Encuentra el último "reinicio" <= hora actual (si ninguno, usa el último del día anterior)
   const d = new Date();
   const h = d.getHours();
 
@@ -564,7 +576,6 @@ function getCurrentResetWindowKey() {
   base.setMinutes(0, 0, 0);
 
   if (chosenHour === null) {
-    // es antes del primer reinicio del día => usar último reinicio de AYER
     base.setDate(base.getDate() - 1);
     chosenHour = sorted[sorted.length - 1];
   }
@@ -573,7 +584,6 @@ function getCurrentResetWindowKey() {
   return makeKey(base);
 }
 
-// Si el bot estuvo apagado y cambió la ventana, resetea automáticamente
 function ensureTramportistaWindow() {
   const currentKey = getCurrentResetWindowKey();
   if (DB.tramportista.resetKey !== currentKey) {
@@ -584,12 +594,14 @@ function ensureTramportistaWindow() {
   return currentKey;
 }
 
-// Main loop checks each 20s
+// =====================
+// MAIN LOOP
+// =====================
 setInterval(async () => {
-  // Plantaciones: check due alerts
+  // Plantaciones
   for (const p of DB.plantaciones) {
     try {
-      if (p.completed) continue; // ✅ ya terminada
+      if (p.completed) continue;
 
       if (p.tipo === "duplicar") {
         if (!p.alertedReady && now() >= p.readyAt) {
@@ -609,7 +621,7 @@ setInterval(async () => {
     } catch {}
   }
 
-  // Chester: remind users when a job becomes ready
+  // Chester reminders + ✅ refrescar panel para reactivar botones/estado
   for (const userId of Object.keys(DB.chester)) {
     for (const job of Object.keys(DB.chester[userId] || {})) {
       if (isNotifiedKey(job)) continue;
@@ -617,22 +629,31 @@ setInterval(async () => {
       const ts = DB.chester[userId][job];
       if (!ts || typeof ts !== "number") continue;
 
-      if (!DB.chester[userId][`${job}_notified`] && now() >= ts) {
-        DB.chester[userId][`${job}_notified`] = true;
+      // ✅ antispam real: solo notificar 1 vez por cada "ts"
+      const notifiedKey = `${job}_notifiedTs`;
+      const alreadyNotifiedTs = DB.chester[userId][notifiedKey] || 0;
+
+      if (now() >= ts && alreadyNotifiedTs !== ts) {
+        // guardar primero (anti duplicado incluso si crashea)
+        DB.chester[userId][notifiedKey] = ts;
         saveJSON("chester.json", DB.chester);
 
+        // refrescar panel para que pase a "Disponible" y habilite el botón
+        await refreshChesterPanel(userId);
+
+        // DM (si se puede)
         try {
           const user = await client.users.fetch(userId);
-          await user.send(`✅ Ya puedes hacer el trabajo de **${capFirst(job)}**.`);
+          await user.send(`✅ Ya puedes hacer el trabajo de **${niceJob(job)}**.`);
         } catch {}
       }
     }
   }
 
-  // Tienda: remind users when a cooldown becomes ready
+  // Tienda reminders (sin duplicados por keys *_notified)
   for (const userId of Object.keys(DB.tienda)) {
     for (const key of Object.keys(DB.tienda[userId] || {})) {
-      if (isNotifiedKey(key)) continue;
+      if (key.endsWith("_notified")) continue;
 
       const ts = DB.tienda[userId][key];
       if (!ts || typeof ts !== "number") continue;
@@ -654,7 +675,7 @@ setInterval(async () => {
   }
 }, 20 * 1000);
 
-// Resets at 00/08/16 ARG: check every minute
+// Reset horario 00/08/16
 setInterval(() => {
   const d = new Date();
   const hour = d.getHours();
@@ -667,7 +688,7 @@ setInterval(() => {
   DB.tienda = {};
   saveJSON("tienda.json", DB.tienda);
 
-  // Reset Tramportista (ventana exacta)
+  // Reset Tramportista
   DB.tramportista.resetKey = makeKey(new Date(d.setMinutes(0, 0, 0)));
   DB.tramportista.done = {};
   saveJSON("tramportista.json", DB.tramportista);
@@ -677,31 +698,7 @@ setInterval(() => {
 }, 60 * 1000);
 
 // =====================
-// RESET HELPERS
-// =====================
-function resetTiendaForUser(userId) {
-  if (!DB.tienda[userId]) return false;
-  delete DB.tienda[userId];
-  saveJSON("tienda.json", DB.tienda);
-  return true;
-}
-function resetChesterForUser(userId) {
-  if (!DB.chester[userId]) return false;
-  delete DB.chester[userId];
-  saveJSON("chester.json", DB.chester);
-  return true;
-}
-function resetAllTienda() {
-  DB.tienda = {};
-  saveJSON("tienda.json", DB.tienda);
-}
-function resetAllChester() {
-  DB.chester = {};
-  saveJSON("chester.json", DB.chester);
-}
-
-// =====================
-// REGISTRO: nombres humanos
+// REGISTRO nombres humanos
 // =====================
 async function resolveUserLabel(userId) {
   if (!userId || userId === "system") return "Sistema";
@@ -738,7 +735,6 @@ client.on("interactionCreate", async (interaction) => {
           channelId: interaction.channelId,
           messageId: null,
 
-          // state
           harvestCount: 0,
           waterCount: 0,
           readyAt: null,
@@ -765,7 +761,7 @@ client.on("interactionCreate", async (interaction) => {
 
         await interaction.reply({
           ephemeral: true,
-          content: `✅ Plantación creada como **${fmtTipo(tipo)}** (#${p.id}). Se dejó su embed en este canal.`,
+          content: `✅ Plantación creada como **${fmtTipo(tipo)}** (#${p.id}).`,
         });
 
         await ensurePlantMessage(p);
@@ -801,8 +797,7 @@ client.on("interactionCreate", async (interaction) => {
         const e = new EmbedBuilder()
           .setTitle("🌿 Plantaciones")
           .setColor(0x95a5a6)
-          .setDescription(lines.join("\n"))
-          .setFooter({ text: "Usa /borrarplantacion numero:X si querés eliminar una." });
+          .setDescription(lines.join("\n"));
 
         return interaction.reply({ ephemeral: true, embeds: [e] });
       }
@@ -812,21 +807,18 @@ client.on("interactionCreate", async (interaction) => {
         const p = getPlantByNumber(numero);
         if (!p) return interaction.reply({ ephemeral: true, content: "No existe esa plantación en la lista." });
 
-        // borramos el embed principal si existe
         const ch = await safeFetchChannel(client, p.channelId);
         if (ch && p.messageId) {
           const msg = await safeFetchMessage(ch, p.messageId);
-          if (msg) await deleteMessageSafe(msg);
+          if (msg) await cleanupAlertMessage(msg);
         }
 
         removePlant(p.id);
 
         logReg({ type: "plantacion_borrada", at: now(), by: interaction.user.id, meta: { plantId: p.id } });
-
         return interaction.reply({ ephemeral: true, content: `🗑️ Plantación #${p.id} eliminada.` });
       }
 
-      // Chester público
       if (name === "chester") {
         const userId = interaction.user.id;
         if (!DB.chester[userId]) DB.chester[userId] = {};
@@ -835,7 +827,16 @@ client.on("interactionCreate", async (interaction) => {
         const e = chesterEmbed(userId);
         const rows = chesterButtons(userId);
 
-        return interaction.reply({ ephemeral: false, embeds: [e], components: rows });
+        // ✅ público
+        const sent = await interaction.reply({ ephemeral: false, embeds: [e], components: rows, fetchReply: true });
+
+        // ✅ guardar panel para refrescarlo automático
+        if (sent?.id) {
+          DB.chesterPanels[userId] = { channelId: interaction.channelId, messageId: sent.id };
+          saveJSON("chester_panels.json", DB.chesterPanels);
+        }
+
+        return;
       }
 
       if (name === "tienda") {
@@ -861,18 +862,13 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
-      // Tramportista
       if (name === "tramportista") {
         const resetKey = ensureTramportistaWindow();
         const userId = interaction.user.id;
 
         if (!DB.tramportista.done) DB.tramportista.done = {};
-
         if (DB.tramportista.done[userId]) {
-          return interaction.reply({
-            ephemeral: true,
-            content: `⚠️ Ya registraste el **Tramportista** en este reinicio (**${resetKey}**).`,
-          });
+          return interaction.reply({ ephemeral: true, content: `⚠️ Ya lo registraste en este reinicio (**${resetKey}**).` });
         }
 
         DB.tramportista.done[userId] = true;
@@ -880,120 +876,11 @@ client.on("interactionCreate", async (interaction) => {
 
         logReg({ type: "tramportista_hecho", at: now(), by: userId, meta: { resetKey } });
 
-        const e = tramportistaEmbed(userId, resetKey);
-
         return interaction.reply({
           ephemeral: false,
-          embeds: [e],
+          embeds: [tramportistaEmbed(userId, resetKey)],
           content: `🚚 **Tramportista registrado** por <@${userId}>.`,
         });
-      }
-
-      // Tramportista lista (ADMIN)
-      if (name === "tramportista_lista") {
-        const guild = interaction.guild;
-        if (!guild) return interaction.reply({ ephemeral: true, content: "Esto solo funciona en un servidor." });
-
-        const resetKey = ensureTramportistaWindow();
-        const doneMap = DB.tramportista.done || {};
-        const doneIds = Object.keys(doneMap).filter(id => doneMap[id]);
-
-        let members;
-        try {
-          members = await guild.members.fetch();
-        } catch {
-          return interaction.reply({
-            ephemeral: true,
-            content: "No pude traer la lista de miembros. Activá SERVER MEMBERS INTENT en el Developer Portal.",
-          });
-        }
-
-        const allHumans = members.filter(m => !m.user.bot).map(m => m.user.id);
-        const notDoneIds = allHumans.filter(id => !doneMap[id]);
-
-        const doneLines = doneIds.length
-          ? doneIds.slice(0, 80).map(id => `✅ ${members.get(id)?.user?.globalName || members.get(id)?.user?.username || "Usuario"} (<@${id}>)`).join("\n")
-          : "— Nadie todavía.";
-
-        const notDoneLines = notDoneIds.length
-          ? notDoneIds.slice(0, 80).map(id => `❌ ${members.get(id)?.user?.globalName || members.get(id)?.user?.username || "Usuario"} (<@${id}>)`).join("\n")
-          : "— Todos lo hicieron.";
-
-        const e = new EmbedBuilder()
-          .setTitle("🚚 Tramportista • Estado (Admin)")
-          .setDescription(`🕒 Reinicio actual: \`${resetKey}\``)
-          .setColor(0x16a085)
-          .addFields(
-            { name: `✅ Hechos (${doneIds.length})`, value: doneLines.slice(0, 1024), inline: false },
-            { name: `❌ No hechos (${notDoneIds.length})`, value: notDoneLines.slice(0, 1024), inline: false },
-          )
-          .setImage(TRAMPORTISTA_IMAGE)
-          .setFooter({ text: "Maleficis • Tramportista" });
-
-        return interaction.reply({ ephemeral: true, embeds: [e] });
-      }
-
-      // Reset personal
-      if (name === "resetmiscd") {
-        const tipo = interaction.options.getString("tipo", true);
-        const userId = interaction.user.id;
-
-        let did = false;
-        if (tipo === "tienda") did = resetTiendaForUser(userId);
-        if (tipo === "chester") did = resetChesterForUser(userId);
-        if (tipo === "todo") {
-          const a = resetTiendaForUser(userId);
-          const b = resetChesterForUser(userId);
-          did = a || b;
-        }
-
-        logReg({ type: "reset_mis_cd", at: now(), by: userId, meta: { tipo } });
-
-        return interaction.reply({
-          ephemeral: true,
-          content: did
-            ? `✅ Listo. Se resetearon tus cooldowns (**${tipo}**).`
-            : `ℹ️ No tenías cooldowns guardados para resetear (**${tipo}**).`,
-        });
-      }
-
-      // Reset admin
-      if (name === "resetcd") {
-        const tipo = interaction.options.getString("tipo", true);
-        const usuario = interaction.options.getUser("usuario");
-
-        if (usuario) {
-          const targetId = usuario.id;
-          let did = false;
-
-          if (tipo === "tienda") did = resetTiendaForUser(targetId);
-          if (tipo === "chester") did = resetChesterForUser(targetId);
-          if (tipo === "todo") {
-            const a = resetTiendaForUser(targetId);
-            const b = resetChesterForUser(targetId);
-            did = a || b;
-          }
-
-          logReg({ type: "admin_reset_cd", at: now(), by: interaction.user.id, meta: { tipo, userId: targetId } });
-
-          return interaction.reply({
-            ephemeral: true,
-            content: did
-              ? `✅ Cooldowns reseteados para <@${targetId}> (**${tipo}**).`
-              : `ℹ️ <@${targetId}> no tenía cooldowns guardados (**${tipo}**).`,
-          });
-        } else {
-          if (tipo === "tienda") resetAllTienda();
-          if (tipo === "chester") resetAllChester();
-          if (tipo === "todo") { resetAllTienda(); resetAllChester(); }
-
-          logReg({ type: "admin_reset_cd_all", at: now(), by: interaction.user.id, meta: { tipo } });
-
-          return interaction.reply({
-            ephemeral: true,
-            content: `✅ Cooldowns reseteados para **TODOS** (**${tipo}**).`,
-          });
-        }
       }
 
       if (name === "registro") {
@@ -1027,13 +914,11 @@ client.on("interactionCreate", async (interaction) => {
             .map(ev => {
               const when = absTs(ev.at);
               const t = ev.type;
-
               let detail = "";
               if (t.startsWith("plantacion")) detail = ev.meta?.plantId ? `(#${ev.meta.plantId})` : "";
-              if (t.startsWith("chester")) detail = ev.meta?.job ? `(${capFirst(ev.meta.job)})` : "";
+              if (t.startsWith("chester")) detail = ev.meta?.job ? `(${niceJob(ev.meta.job)})` : "";
               if (t.startsWith("tienda")) detail = ev.meta?.nombre ? `(${ev.meta.modo} • ${ev.meta.nombre})` : "";
               if (t.startsWith("tramportista")) detail = ev.meta?.resetKey ? `(${ev.meta.resetKey})` : "";
-
               return `• ${when} — **${t}** ${detail}`.trim();
             });
 
@@ -1049,11 +934,7 @@ client.on("interactionCreate", async (interaction) => {
           e.addFields({ name: b.who.slice(0, 256), value: (b.lines.join("\n") || "—").slice(0, 1024), inline: false });
         }
 
-        return interaction.reply({
-          ephemeral: true,
-          embeds: [e],
-          components: registroButtons(),
-        });
+        return interaction.reply({ ephemeral: true, embeds: [e] });
       }
     }
 
@@ -1063,24 +944,23 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isButton()) {
       const id = interaction.customId;
 
-      // ===== Plantaciones =====
+      // Plantaciones
       if (id.startsWith("plant_")) {
-        const parts = id.split("_"); // plant_action_id
+        const parts = id.split("_");
         const action = parts[1];
         const plantId = parseInt(parts[2], 10);
 
         const p = DB.plantaciones.find(x => x.id === plantId);
         if (!p) {
           await interaction.reply({ ephemeral: true, content: "Esa plantación ya no existe." });
-          await deleteMessageSafe(interaction.message);
+          await cleanupAlertMessage(interaction.message);
           return;
         }
 
-        // duplicar -> cultivar
         if (p.tipo === "duplicar" && action === "cultivar") {
           if (p.completed) {
             await interaction.reply({ ephemeral: true, content: "✅ Esa plantación ya está completada." });
-            await deleteMessageSafe(interaction.message);
+            await cleanupAlertMessage(interaction.message);
             return;
           }
           if (now() < p.readyAt) {
@@ -1088,33 +968,21 @@ client.on("interactionCreate", async (interaction) => {
             return;
           }
 
-          // marcar completada y actualizar embed principal
-          updatePlant({
-            id: p.id,
-            completed: true,
-            completedAt: now(),
-            alertedReady: true,
-          });
+          updatePlant({ id: p.id, completed: true, completedAt: now(), alertedReady: true });
 
           logReg({ type: "plantacion_completada", at: now(), by: interaction.user.id, meta: { plantId: p.id, tipo: p.tipo } });
 
           const updated = DB.plantaciones.find(x => x.id === p.id);
           await ensurePlantMessage(updated);
+          await cleanupAlertMessage(interaction.message);
 
-          // ✅ borrar el mensaje de alerta con botón
-          await deleteMessageSafe(interaction.message);
-
-          return interaction.reply({
-            ephemeral: false,
-            content: `✅ Plantación #${p.id} completada por <@${interaction.user.id}>.`,
-          });
+          return interaction.reply({ ephemeral: false, content: `✅ Plantación #${p.id} completada por <@${interaction.user.id}>.` });
         }
 
-        // cosecha -> regar / cosechar
         if (p.tipo === "cosecha") {
           if (p.completed) {
             await interaction.reply({ ephemeral: true, content: "✅ Esa plantación ya está completada." });
-            await deleteMessageSafe(interaction.message);
+            await cleanupAlertMessage(interaction.message);
             return;
           }
 
@@ -1126,25 +994,15 @@ client.on("interactionCreate", async (interaction) => {
             const newWaterAt = now() + REGAR_MS;
             const newWaterCount = (p.waterCount || 0) + 1;
 
-            updatePlant({
-              id: p.id,
-              waterCount: newWaterCount,
-              nextWaterAt: newWaterAt,
-              alertedWater: false,
-            });
+            updatePlant({ id: p.id, waterCount: newWaterCount, nextWaterAt: newWaterAt, alertedWater: false });
 
             logReg({ type: "plantacion_regada", at: now(), by: interaction.user.id, meta: { plantId: p.id } });
 
             const updated = DB.plantaciones.find(x => x.id === p.id);
             await ensurePlantMessage(updated);
+            await cleanupAlertMessage(interaction.message);
 
-            // ✅ borrar el mensaje de alerta con botón
-            await deleteMessageSafe(interaction.message);
-
-            return interaction.reply({
-              ephemeral: false,
-              content: `💧 Plantación #${p.id} regada por <@${interaction.user.id}>. Próximo riego ${relTs(newWaterAt)}.`,
-            });
+            return interaction.reply({ ephemeral: false, content: `💧 Plantación #${p.id} regada por <@${interaction.user.id}>. Próximo riego ${relTs(newWaterAt)}.` });
           }
 
           if (action === "cosechar") {
@@ -1155,7 +1013,6 @@ client.on("interactionCreate", async (interaction) => {
             const newCount = (p.harvestCount || 0) + 1;
 
             if (newCount >= MAX_COSECHAS) {
-              // ✅ completada
               updatePlant({
                 id: p.id,
                 harvestCount: newCount,
@@ -1169,85 +1026,60 @@ client.on("interactionCreate", async (interaction) => {
 
               const updated = DB.plantaciones.find(x => x.id === p.id);
               await ensurePlantMessage(updated);
+              await cleanupAlertMessage(interaction.message);
 
-              // ✅ borrar el mensaje de alerta con botón
-              await deleteMessageSafe(interaction.message);
-
-              return interaction.reply({
-                ephemeral: false,
-                content: `✅ Plantación #${p.id} completada (3/3) por <@${interaction.user.id}>.`,
-              });
+              return interaction.reply({ ephemeral: false, content: `✅ Plantación #${p.id} completada (3/3) por <@${interaction.user.id}>.` });
             }
 
-            // sigue activa
             const newHarvestAt = now() + COSECHAR_MS;
-            updatePlant({
-              id: p.id,
-              harvestCount: newCount,
-              nextHarvestAt: newHarvestAt,
-              alertedHarvest: false,
-            });
+            updatePlant({ id: p.id, harvestCount: newCount, nextHarvestAt: newHarvestAt, alertedHarvest: false });
 
             logReg({ type: "plantacion_cosechada", at: now(), by: interaction.user.id, meta: { plantId: p.id, count: newCount } });
 
             const updated = DB.plantaciones.find(x => x.id === p.id);
             await ensurePlantMessage(updated);
+            await cleanupAlertMessage(interaction.message);
 
-            // ✅ borrar el mensaje de alerta con botón
-            await deleteMessageSafe(interaction.message);
-
-            return interaction.reply({
-              ephemeral: false,
-              content: `🧺 Plantación #${p.id} cosechada por <@${interaction.user.id}> (**${newCount}/${MAX_COSECHAS}**). Próxima: ${relTs(newHarvestAt)}.`,
-            });
+            return interaction.reply({ ephemeral: false, content: `🧺 Plantación #${p.id} cosechada por <@${interaction.user.id}> (**${newCount}/${MAX_COSECHAS}**). Próxima: ${relTs(newHarvestAt)}.` });
           }
         }
-
-        return;
       }
 
-      // ===== Chester =====
+      // Chester
       if (id.startsWith("chester_")) {
         const [, job, userId] = id.split("_");
 
         if (interaction.user.id !== userId) {
           return interaction.reply({ ephemeral: true, content: "🔒 Este panel es personal. Usá **/chester** para el tuyo." });
         }
-
         if (!CHESTER_JOBS.includes(job)) {
           return interaction.reply({ ephemeral: true, content: "Trabajo inválido." });
         }
 
         if (!DB.chester[userId]) DB.chester[userId] = {};
+
         const nextTs = DB.chester[userId][job] || 0;
         if (now() < nextTs) {
           return interaction.reply({ ephemeral: true, content: `⏳ Aún en cooldown. Disponible ${relTs(nextTs)}.` });
         }
 
-        DB.chester[userId][job] = now() + CHESTER_CD_MS;
-        DB.chester[userId][`${job}_notified`] = false;
+        const newTs = now() + CHESTER_CD_MS;
+
+        DB.chester[userId][job] = newTs;
+        // ✅ resetea el notifiedTs para este nuevo cooldown (si tenía el anterior guardado)
+        DB.chester[userId][`${job}_notifiedTs`] = 0;
+
         saveJSON("chester.json", DB.chester);
 
         logReg({ type: "chester_job", at: now(), by: interaction.user.id, meta: { job } });
 
-        const e = chesterEmbed(userId);
-        const rows = chesterButtons(userId);
-
-        return interaction.update({ embeds: [e], components: rows });
-      }
-
-      // ===== Registro =====
-      if (id === "registro_borrar") {
-        const member = interaction.member;
-        const isAdmin = member?.permissions?.has?.(PermissionFlagsBits.Administrator);
-        if (!isAdmin) return interaction.reply({ ephemeral: true, content: "Solo administradores." });
-
-        DB.registro = [];
-        saveJSON("registro.json", DB.registro);
+        // ✅ update del mensaje + guardado del panel por si fue editado/movido
+        DB.chesterPanels[userId] = { channelId: interaction.channelId, messageId: interaction.message.id };
+        saveJSON("chester_panels.json", DB.chesterPanels);
 
         return interaction.update({
-          embeds: [new EmbedBuilder().setTitle("📚 Registro").setDescription("🗑️ Registro eliminado.").setColor(0x2ecc71)],
-          components: [],
+          embeds: [chesterEmbed(userId)],
+          components: chesterButtons(userId),
         });
       }
     }
@@ -1265,10 +1097,8 @@ client.on("interactionCreate", async (interaction) => {
 client.once("ready", async () => {
   console.log(`🤖 Bot listo: ${client.user.tag}`);
 
-  // Normaliza tramportista por ventana actual (si cambió mientras estaba caído)
   ensureTramportistaWindow();
 
-  // ensure all plant embeds exist
   for (const p of DB.plantaciones) {
     await ensurePlantMessage(p);
   }
