@@ -1,4 +1,4 @@
-// index.js - Maleficis Plantaciones + Chester + CDs Armas + LOGS (/dia /log)
+// index.js - Maleficis Plantaciones + Chester + CDs Armas + LOGS + RESET TOTAL
 require("dotenv").config();
 
 const fs = require("fs");
@@ -30,7 +30,7 @@ const REGAR_MS    = (2 * 60 + 30) * 60 * 1000; // 2h 30m
 const COSECHAR_MS = 3 * 60 * 60 * 1000;        // 3h
 const MAX_COSECHAS = 3;
 
-// Ping role exacto (por nombre)
+// Ping role exacto por nombre
 const PING_ROLE_NAME = "marihuana";
 
 // Chester
@@ -48,10 +48,10 @@ const CHESTER_CD_MS = 24 * 60 * 60 * 1000; // 24h
 
 // CDs Armas
 const ARMA_CD = {
-  revolver: 2 * 24 * 60 * 60 * 1000,        // 2 días
-  sns: 4 * 24 * 60 * 60 * 1000,             // 4 días
-  balas_revolver: 1 * 24 * 60 * 60 * 1000,  // 1 día
-  balas_sns: 2 * 24 * 60 * 60 * 1000,       // 2 días
+  revolver: 2 * 24 * 60 * 60 * 1000,
+  sns: 4 * 24 * 60 * 60 * 1000,
+  balas_revolver: 1 * 24 * 60 * 60 * 1000,
+  balas_sns: 2 * 24 * 60 * 60 * 1000,
 };
 const ARMA_LABEL = {
   revolver: "Revolver",
@@ -79,13 +79,14 @@ function saveJSON(file, data) {
   const p = path.join(DATA_DIR, file);
   fs.writeFileSync(p, JSON.stringify(data, null, 2), "utf8");
 }
+function writeJSON(file, data) { saveJSON(file, data); }
 
 const DB = {
   plantaciones: loadJSON("plantaciones.json", []),
   chester: loadJSON("chester.json", {}),
   chesterPanels: loadJSON("chester_panels.json", {}),
   armas: loadJSON("armas.json", {}),
-  registro: loadJSON("registro.json", []), // LOGS
+  registro: loadJSON("registro.json", []),
 };
 
 function now() { return Date.now(); }
@@ -95,7 +96,7 @@ function absTs(ms) { return `<t:${toUnix(ms)}:f>`; }
 
 function logReg(type, by, meta = {}) {
   DB.registro.push({ type, by, at: now(), meta });
-  saveJSON("registro.json", DB.registro);
+  writeJSON("registro.json", DB.registro);
 }
 
 function capFirst(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
@@ -112,13 +113,13 @@ function getPlantByNumber(n) {
 }
 function removePlant(id) {
   DB.plantaciones = DB.plantaciones.filter(p => p.id !== id);
-  saveJSON("plantaciones.json", DB.plantaciones);
+  writeJSON("plantaciones.json", DB.plantaciones);
 }
 function updatePlant(patch) {
   const idx = DB.plantaciones.findIndex(p => p.id === patch.id);
   if (idx >= 0) {
     DB.plantaciones[idx] = { ...DB.plantaciones[idx], ...patch };
-    saveJSON("plantaciones.json", DB.plantaciones);
+    writeJSON("plantaciones.json", DB.plantaciones);
   }
 }
 
@@ -137,7 +138,7 @@ function isNotifiedKey(k) {
 }
 
 // =====================
-// DISCORD CLIENT (sin intents extra)
+// DISCORD CLIENT
 // =====================
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
@@ -186,6 +187,7 @@ function plantCompletedEmbed(p) {
   lines.push(`📌 **${fmtTipo(p.tipo)}** — ${desc}`);
   lines.push(`🌱 **Plantó:** ${plantedBy}`);
 
+  // si nadie regó/cosechó, no lo muestro
   if ((waterCount > 0) || (harvestCount > 0)) {
     lines.push(`💧 **Regó:** ${waterCount}`);
     lines.push(`🧺 **Cosechó:** ${harvestCount}`);
@@ -193,8 +195,9 @@ function plantCompletedEmbed(p) {
 
   e.setDescription(lines.join("\n"));
 
-  // duplicar terminado: no foto
+  // duplicar terminado: sin foto
   if (p.tipo !== "duplicar" && p.imageUrl) e.setImage(p.imageUrl);
+
   return e;
 }
 
@@ -234,6 +237,7 @@ function plantEmbed(p) {
   }
 
   if (p.imageUrl) e.setImage(p.imageUrl);
+
   return e;
 }
 
@@ -246,7 +250,9 @@ function plantAlertEmbed(p) {
 
   const desc = (p.descripcion && p.descripcion.trim()) ? p.descripcion.trim() : "Sin descripción.";
   e.setDescription(desc);
+
   if (p.imageUrl) e.setImage(p.imageUrl);
+
   return e;
 }
 
@@ -283,7 +289,6 @@ function armaEmbed(userId, key, nextTs) {
     { name: "👤 Usuario", value: `<@${userId}>`, inline: true },
     { name: "✅ Disponible", value: relTs(nextTs), inline: true },
   );
-
   return e;
 }
 
@@ -352,7 +357,7 @@ function plantAlertButtons(p, kind) {
 }
 
 // =====================
-// ANTI-DUPES: localizar mensaje original por PID
+// ANTI DUPES: buscar mensajes originales por PID
 // =====================
 async function findPlantMessagesInChannel(channel, plantId) {
   try {
@@ -377,9 +382,10 @@ async function findPlantMessagesInChannel(channel, plantId) {
 }
 
 const plantEnsureLock = new Set();
+const plantAlertLock = new Set();
 
 // =====================
-// PLANT: ORIGINAL MESSAGE (anti spam)
+// PLANT: asegurar SOLO 1 embed original por plantación
 // =====================
 async function ensurePlantMessage(p) {
   if (plantEnsureLock.has(p.id)) return;
@@ -418,44 +424,64 @@ async function ensurePlantMessage(p) {
 }
 
 // =====================
-// ALERTS: 1 SOLO MENSAJE, y se borra al tocar botón
+// ALERTS: 1 SOLO MENSAJE, NO SPAM, lock + persistencia en memoria
 // =====================
 async function sendPlantAlert(p, kind) {
-  const ch = await safeFetchChannel(client, p.channelId);
-  if (!ch) return;
+  const lockKey = `${p.id}:${p.tipo}:${kind}`;
+  if (plantAlertLock.has(lockKey)) return;
+  plantAlertLock.add(lockKey);
 
-  const alertKey =
-    p.tipo === "duplicar" ? "alertMessageIdReady" :
-    (kind === "regar" ? "alertMessageIdWater" : "alertMessageIdHarvest");
+  try {
+    const ch = await safeFetchChannel(client, p.channelId);
+    if (!ch) return;
 
-  const existingId = p[alertKey];
-  if (existingId) {
-    const ex = await safeFetchMessage(ch, existingId);
-    if (ex) return;
-  }
+    const alertKey =
+      p.tipo === "duplicar" ? "alertMessageIdReady" :
+      (kind === "regar" ? "alertMessageIdWater" : "alertMessageIdHarvest");
 
-  const pingInfo = await getRoleMentionForGuild(ch.guild);
+    // Si existe ID guardado y el msg existe => no mando otro
+    if (p[alertKey]) {
+      const ex = await safeFetchMessage(ch, p[alertKey]);
+      if (ex) return;
+      // si no existe, limpio
+      p[alertKey] = null;
+      updatePlant({ id: p.id, [alertKey]: null });
+    }
 
-  let text = "Hay que regar";
-  if (p.tipo === "duplicar") text = "Hay que cultivar";
-  else if (kind === "cosechar") text = "Hay que cosechar";
+    // Si ya fue alertado => no mando otro
+    if (p.tipo === "duplicar" && p.alertedReady) return;
+    if (p.tipo === "cosecha" && kind === "regar" && p.alertedWater) return;
+    if (p.tipo === "cosecha" && kind === "cosechar" && p.alertedHarvest) return;
 
-  const sent = await ch.send({
-    content: `${pingInfo.content} ${text}`,
-    allowedMentions: pingInfo.allowedMentions,
-    embeds: [plantAlertEmbed(p)],
-    components: plantAlertButtons(p, kind),
-  }).catch(() => null);
+    const pingInfo = await getRoleMentionForGuild(ch.guild);
 
-  if (sent) {
-    const patch = { id: p.id };
-    patch[alertKey] = sent.id;
+    let text = "Hay que regar";
+    if (p.tipo === "duplicar") text = "Hay que cultivar";
+    else if (kind === "cosechar") text = "Hay que cosechar";
 
-    if (p.tipo === "duplicar") patch.alertedReady = true;
-    else if (kind === "regar") patch.alertedWater = true;
-    else patch.alertedHarvest = true;
+    const sent = await ch.send({
+      content: `${pingInfo.content} ${text}`,
+      allowedMentions: pingInfo.allowedMentions,
+      embeds: [plantAlertEmbed(p)],
+      components: plantAlertButtons(p, kind),
+    }).catch(() => null);
 
+    if (!sent) return;
+
+    // Persistencia: memoria + json
+    p[alertKey] = sent.id;
+
+    const patch = { id: p.id, [alertKey]: sent.id };
+    if (p.tipo === "duplicar") {
+      p.alertedReady = true; patch.alertedReady = true;
+    } else if (kind === "regar") {
+      p.alertedWater = true; patch.alertedWater = true;
+    } else {
+      p.alertedHarvest = true; patch.alertedHarvest = true;
+    }
     updatePlant(patch);
+  } finally {
+    plantAlertLock.delete(lockKey);
   }
 }
 
@@ -484,13 +510,11 @@ async function refreshChesterPanel(userId) {
 // =====================
 function localYMD(ts) {
   const d = new Date(ts);
-  // respeta TZ del proceso (Railway: TZ=America/Argentina/Buenos_Aires)
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
   const da = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${da}`;
 }
-
 async function getDisplayName(guild, userId) {
   try {
     const m = await guild.members.fetch(userId).catch(() => null);
@@ -501,11 +525,6 @@ async function getDisplayName(guild, userId) {
     if (u) return u.username;
   } catch {}
   return userId;
-}
-
-function addToMapList(map, key, value) {
-  if (!map[key]) map[key] = [];
-  map[key].push(value);
 }
 
 // =====================
@@ -599,6 +618,11 @@ const commands = [
         .setDescription("Filtrar por usuario (opcional)")
         .setRequired(false)
     ),
+
+  new SlashCommandBuilder()
+    .setName("resetbot")
+    .setDescription("🧨 RESET TOTAL del bot (borra TODO) (ADMIN)")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 ].map(c => c.toJSON());
 
 // =====================
@@ -613,8 +637,12 @@ client.once("ready", async () => {
 // LOOP (20s)
 // =====================
 setInterval(async () => {
-  for (const p of DB.plantaciones) {
+  // Plantaciones: re-leer “fresco” para evitar spam
+  for (const item of DB.plantaciones) {
     try {
+      const p = DB.plantaciones.find(x => x.id === item.id);
+      if (!p) continue;
+
       await ensurePlantMessage(p);
       if (p.completed) continue;
 
@@ -640,7 +668,7 @@ setInterval(async () => {
 
       if (now() >= ts && alreadyNotifiedTs !== ts) {
         DB.chester[userId][notifiedKey] = ts;
-        saveJSON("chester.json", DB.chester);
+        writeJSON("chester.json", DB.chester);
 
         await refreshChesterPanel(userId);
 
@@ -665,7 +693,7 @@ setInterval(async () => {
 
       if (now() >= ts && alreadyNotifiedTs !== ts) {
         DB.armas[userId][notifiedKey] = ts;
-        saveJSON("armas.json", DB.armas);
+        writeJSON("armas.json", DB.armas);
 
         try {
           const user = await client.users.fetch(userId);
@@ -725,7 +753,7 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         DB.plantaciones.push(p);
-        saveJSON("plantaciones.json", DB.plantaciones);
+        writeJSON("plantaciones.json", DB.plantaciones);
 
         logReg("plantacion_creada", interaction.user.id, { plantId: p.id, tipo, descripcion });
 
@@ -773,7 +801,7 @@ client.on("interactionCreate", async (interaction) => {
       if (name === "chester") {
         const userId = interaction.user.id;
         if (!DB.chester[userId]) DB.chester[userId] = {};
-        saveJSON("chester.json", DB.chester);
+        writeJSON("chester.json", DB.chester);
 
         const existed = await refreshChesterPanel(userId);
         if (existed) return interaction.reply({ ephemeral: true, content: "✅ Panel de Chester actualizado (guardado)." });
@@ -787,7 +815,7 @@ client.on("interactionCreate", async (interaction) => {
 
         if (sent?.id) {
           DB.chesterPanels[userId] = { channelId: interaction.channelId, messageId: sent.id };
-          saveJSON("chester_panels.json", DB.chesterPanels);
+          writeJSON("chester_panels.json", DB.chesterPanels);
         }
         return;
       }
@@ -801,7 +829,7 @@ client.on("interactionCreate", async (interaction) => {
         const nextTs = now() + ARMA_CD[key];
         DB.armas[interaction.user.id][key] = nextTs;
         DB.armas[interaction.user.id][`${key}_notifiedTs`] = 0;
-        saveJSON("armas.json", DB.armas);
+        writeJSON("armas.json", DB.armas);
 
         logReg("arma_cd", interaction.user.id, { arma: key, label: ARMA_LABEL[key] });
 
@@ -826,7 +854,6 @@ client.on("interactionCreate", async (interaction) => {
           return interaction.reply({ ephemeral: true, content: `No hay logs para **Día ${dayNum}**.` });
         }
 
-        // Agrupar por userId
         const byUser = {};
         for (const e of entries) {
           const u = e.by || "system";
@@ -834,7 +861,6 @@ client.on("interactionCreate", async (interaction) => {
           byUser[u].push(e);
         }
 
-        // Construir resumen
         const blocks = [];
         for (const [uid, arr] of Object.entries(byUser)) {
           const plant = { planto: 0, rego: 0, cosecho: 0, completo: 0 };
@@ -846,7 +872,6 @@ client.on("interactionCreate", async (interaction) => {
             if (ev.type === "plantacion_regada") plant.rego++;
             if (ev.type === "plantacion_cosechada") plant.cosecho++;
             if (ev.type === "plantacion_completada") plant.completo++;
-
             if (ev.type === "chester_job" && ev.meta?.job) chester.add(niceJob(ev.meta.job));
             if (ev.type === "arma_cd" && ev.meta?.label) armas.add(ev.meta.label);
           }
@@ -862,7 +887,6 @@ client.on("interactionCreate", async (interaction) => {
           if (armas.size) parts.push(`🔫 Armas: **${[...armas].join(", ")}**`);
 
           if (parts.length === 0) continue;
-
           blocks.push({ name, text: parts.join(" • ") });
         }
 
@@ -884,22 +908,14 @@ client.on("interactionCreate", async (interaction) => {
         const usuario = interaction.options.getUser("usuario");
 
         let entries = DB.registro.slice();
-
         if (usuario) entries = entries.filter(e => e.by === usuario.id);
 
-        if (tipo === "plantaciones") {
-          entries = entries.filter(e => e.type.startsWith("plantacion_"));
-        } else if (tipo === "chester") {
-          entries = entries.filter(e => e.type.startsWith("chester_"));
-        } else if (tipo === "armas") {
-          entries = entries.filter(e => e.type.startsWith("arma_"));
-        }
+        if (tipo === "plantaciones") entries = entries.filter(e => e.type.startsWith("plantacion_"));
+        else if (tipo === "chester") entries = entries.filter(e => e.type.startsWith("chester_"));
+        else if (tipo === "armas") entries = entries.filter(e => e.type.startsWith("arma_"));
 
-        if (entries.length === 0) {
-          return interaction.reply({ ephemeral: true, content: "No hay logs con ese filtro." });
-        }
+        if (entries.length === 0) return interaction.reply({ ephemeral: true, content: "No hay logs con ese filtro." });
 
-        // Agrupar por usuario para “todos”
         const byUser = {};
         for (const ev of entries) {
           const u = ev.by || "system";
@@ -934,6 +950,24 @@ client.on("interactionCreate", async (interaction) => {
 
         return interaction.reply({ ephemeral: true, embeds: [e] });
       }
+
+      if (name === "resetbot") {
+        // Reset TOTAL en RAM
+        DB.plantaciones = [];
+        DB.chester = {};
+        DB.chesterPanels = {};
+        DB.armas = {};
+        DB.registro = [];
+
+        // Reset TOTAL en DISCO
+        writeJSON("plantaciones.json", DB.plantaciones);
+        writeJSON("chester.json", DB.chester);
+        writeJSON("chester_panels.json", DB.chesterPanels);
+        writeJSON("armas.json", DB.armas);
+        writeJSON("registro.json", DB.registro);
+
+        return interaction.reply({ ephemeral: true, content: "🧨 RESET TOTAL hecho. Bot limpio (sin memoria vieja)." });
+      }
     }
 
     // =====================
@@ -949,7 +983,6 @@ client.on("interactionCreate", async (interaction) => {
         const plantId = parseInt(parts[2], 10);
 
         const p = DB.plantaciones.find(x => x.id === plantId);
-
         if (!p) {
           await deleteMessageIfPossible(interaction.message);
           return interaction.reply({ ephemeral: true, content: "Esa plantación ya no existe." });
@@ -1051,6 +1084,7 @@ client.on("interactionCreate", async (interaction) => {
             return interaction.reply({ ephemeral: true, content: `🧺 Cosechada (${newCount}/${MAX_COSECHAS}). Próxima: ${relTs(newHarvestAt)}` });
           }
         }
+
         return;
       }
 
@@ -1071,10 +1105,10 @@ client.on("interactionCreate", async (interaction) => {
         const newTs = now() + CHESTER_CD_MS;
         DB.chester[userId][job] = newTs;
         DB.chester[userId][`${job}_notifiedTs`] = 0;
-        saveJSON("chester.json", DB.chester);
+        writeJSON("chester.json", DB.chester);
 
         DB.chesterPanels[userId] = { channelId: interaction.channelId, messageId: interaction.message.id };
-        saveJSON("chester_panels.json", DB.chesterPanels);
+        writeJSON("chester_panels.json", DB.chesterPanels);
 
         logReg("chester_job", interaction.user.id, { job });
 
@@ -1103,7 +1137,8 @@ client.on("interactionCreate", async (interaction) => {
 
   const rest = new REST({ version: "10" }).setToken(TOKEN);
   await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
-  console.log("✅ Comandos registrados:", commands.map(c => c.name).join(", "));
+  console.log("✅ Comandos registrados.");
 
   await client.login(TOKEN);
 })();
+
