@@ -1,4 +1,4 @@
-// index.js - Maleficis Plantaciones + Chester + Tienda + CDs Armas (Railway ready)
+// index.js - Maleficis Plantaciones + Chester + Tienda + CDs Armas (ANTI SPAM / ANTI DUPES)
 require("dotenv").config();
 
 const fs = require("fs");
@@ -41,14 +41,10 @@ const CHESTER_JOBS = [
   "ruedas",
   "grafitis",
   "peleas",
-  "moto",     // antes transporte
+  "moto",
   "coche",
 ];
 const CHESTER_CD_MS = 24 * 60 * 60 * 1000; // 24h
-
-// Tienda
-const TIENDA_CD_SOLO_MS  = 5 * 60 * 60 * 1000;  // 5h
-const TIENDA_CD_GRUPO_MS = 2 * 60 * 60 * 1000;  // 2h
 
 // CDs Armas
 const ARMA_CD = {
@@ -57,15 +53,12 @@ const ARMA_CD = {
   balas_revolver: 1 * 24 * 60 * 60 * 1000,  // 1 día
   balas_sns: 2 * 24 * 60 * 60 * 1000,       // 2 días
 };
-
 const ARMA_LABEL = {
   revolver: "Revolver",
   sns: "SNS",
   balas_revolver: "Balas de Revolver",
   balas_sns: "Balas de SNS",
 };
-
-// Use TZ Argentina en Railway: TZ=America/Argentina/Buenos_Aires
 
 // =====================
 // SIMPLE FILE DB
@@ -89,10 +82,10 @@ function saveJSON(file, data) {
 
 const DB = {
   plantaciones: loadJSON("plantaciones.json", []),
-  chester: loadJSON("chester.json", {}),               // { userId: { job: nextTs, job_notifiedTs: ts } }
-  chesterPanels: loadJSON("chester_panels.json", {}),  // { userId: { channelId, messageId } }
+  chester: loadJSON("chester.json", {}),
+  chesterPanels: loadJSON("chester_panels.json", {}),
   tienda: loadJSON("tienda.json", {}),
-  armas: loadJSON("armas.json", {}),                   // { userId: { key: nextTs, key_notifiedTs: ts } }
+  armas: loadJSON("armas.json", {}),
   registro: loadJSON("registro.json", []),
 };
 
@@ -140,15 +133,18 @@ async function safeFetchChannel(client, channelId) {
 async function safeFetchMessage(channel, messageId) {
   try { return await channel.messages.fetch(messageId); } catch { return null; }
 }
+async function deleteMessageIfPossible(msg) {
+  if (!msg) return;
+  try { await msg.delete(); } catch {}
+}
 
 function isNotifiedKey(k) {
   return typeof k === "string" && (k.endsWith("_notified") || k.endsWith("_notifiedTs"));
 }
 
 // =====================
-// DISCORD CLIENT
+// DISCORD CLIENT (sin intents extra)
 // =====================
-// Sin intents extra para evitar "Used disallowed intents"
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
   partials: [Partials.Channel],
@@ -182,8 +178,6 @@ async function getRoleMentionForGuild(guild) {
 // =====================
 // EMBEDS
 // =====================
-
-// Embed ORIGINAL (estado general) — este es el único que queda en el canal
 function plantCompletedEmbed(p) {
   const created = p.createdAt ?? now();
   const plantedBy = p.createdBy ? `<@${p.createdBy}>` : "—";
@@ -194,16 +188,15 @@ function plantCompletedEmbed(p) {
   const e = new EmbedBuilder()
     .setTitle(`✅ Plantación completada • #${p.id}`)
     .setColor(0x2ecc71)
-    .setFooter({ text: "Maleficis • Plantaciones" })
+    .setFooter({ text: `Maleficis • Plantaciones • PID:#${p.id}` })
     .setTimestamp(new Date(created));
 
   const desc = (p.descripcion && p.descripcion.trim()) ? p.descripcion.trim() : "Sin descripción.";
 
-  let lines = [];
+  const lines = [];
   lines.push(`📌 **${fmtTipo(p.tipo)}** — ${desc}`);
   lines.push(`🌱 **Plantó:** ${plantedBy}`);
 
-  // Solo mostrar regó/cosechó si hubo acción
   if ((waterCount > 0) || (harvestCount > 0)) {
     lines.push(`💧 **Regó:** ${waterCount}${p.lastWaterBy ? ` (último: <@${p.lastWaterBy}>)` : ""}`);
     lines.push(`🧺 **Cosechó:** ${harvestCount}${p.lastHarvestBy ? ` (último: <@${p.lastHarvestBy}>)` : ""}`);
@@ -211,7 +204,7 @@ function plantCompletedEmbed(p) {
 
   e.setDescription(lines.join("\n"));
 
-  // Si es duplicar, nunca mostrar foto al terminar
+  // duplicar terminado: no foto
   if (p.tipo !== "duplicar" && p.imageUrl) e.setImage(p.imageUrl);
 
   return e;
@@ -221,15 +214,15 @@ function plantEmbed(p) {
   if (p.completed) return plantCompletedEmbed(p);
 
   const created = p.createdAt ?? now();
+
   const e = new EmbedBuilder()
     .setTitle(`🌿 Plantación #${p.id}`)
     .setColor(p.tipo === "duplicar" ? 0x2ecc71 : 0x3498db)
-    .setFooter({ text: "Maleficis • Plantaciones" })
+    .setFooter({ text: `Maleficis • Plantaciones • PID:#${p.id}` })
     .setTimestamp(new Date(created));
 
   const desc = (p.descripcion && p.descripcion.trim()) ? p.descripcion.trim() : "Sin descripción.";
 
-  // Mantenerlo lindo pero no spam
   e.addFields(
     { name: "📝 Descripción", value: desc, inline: false },
     { name: "📌 Tipo", value: fmtTipo(p.tipo), inline: true },
@@ -256,16 +249,15 @@ function plantEmbed(p) {
   return e;
 }
 
-// Embed ALERTA (mínimo) — SOLO para mensajes nuevos de regar/cosechar/cultivar
+// ALERTA MINIMA
 function plantAlertEmbed(p) {
   const e = new EmbedBuilder()
     .setTitle(`🌿 Plantación #${p.id}`)
     .setColor(0x5865f2)
-    .setFooter({ text: "Maleficis • Plantaciones" });
+    .setFooter({ text: `Maleficis • Plantaciones • PID:#${p.id}` });
 
   const desc = (p.descripcion && p.descripcion.trim()) ? p.descripcion.trim() : "Sin descripción.";
   e.setDescription(desc);
-
   if (p.imageUrl) e.setImage(p.imageUrl);
   return e;
 }
@@ -290,22 +282,6 @@ function chesterEmbed(userId) {
   });
 
   e.addFields({ name: "📋 Estado", value: lines.join("\n"), inline: false });
-  return e;
-}
-
-function tiendaEmbed(userId, modo, nombre, nextTs) {
-  const e = new EmbedBuilder()
-    .setTitle("🏪 Robo a tienda • Cooldown")
-    .setColor(0xe67e22)
-    .setFooter({ text: "Maleficis • Tiendas" });
-
-  e.addFields(
-    { name: "👤 Usuario", value: `<@${userId}>`, inline: true },
-    { name: "👥 Modo", value: modo === "grupo" ? "Grupo (2h)" : "Solo (5h)", inline: true },
-    { name: "📍 Tienda", value: nombre, inline: false },
-    { name: "✅ Disponible", value: relTs(nextTs), inline: true },
-  );
-
   return e;
 }
 
@@ -388,51 +364,100 @@ function plantAlertButtons(p, kind) {
 }
 
 // =====================
-// HELPERS: CLEANUP SPAM MSG
+// ANTI-DUPES: localizar mensaje original por PID
 // =====================
-async function deleteMessageIfPossible(msg) {
-  if (!msg) return;
-  try { await msg.delete(); } catch {}
+async function findPlantMessagesInChannel(channel, plantId) {
+  try {
+    const fetched = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+    if (!fetched) return [];
+    const meId = client.user?.id;
+    const key = `PID:#${plantId}`;
+
+    const msgs = [];
+    for (const m of fetched.values()) {
+      if (meId && m.author?.id !== meId) continue;
+      const emb = m.embeds?.[0];
+      const footer = emb?.footer?.text || "";
+      const title = emb?.title || "";
+      if (footer.includes(key) || title.includes(`#${plantId}`)) {
+        msgs.push(m);
+      }
+    }
+    // newest first
+    msgs.sort((a, b) => (b.createdTimestamp || 0) - (a.createdTimestamp || 0));
+    return msgs;
+  } catch {
+    return [];
+  }
 }
 
+// LOCK simple para evitar doble send concurrente en un mismo proceso
+const plantEnsureLock = new Set();
+
 // =====================
-// PLANT: ORIGINAL MESSAGE (solo se edita)
+// PLANT: ORIGINAL MESSAGE (anti spam)
 // =====================
 async function ensurePlantMessage(p) {
-  const ch = await safeFetchChannel(client, p.channelId);
-  if (!ch) return;
+  if (plantEnsureLock.has(p.id)) return;
+  plantEnsureLock.add(p.id);
 
-  const embed = plantEmbed(p);
+  try {
+    const ch = await safeFetchChannel(client, p.channelId);
+    if (!ch) return;
 
-  if (p.messageId) {
-    const msg = await safeFetchMessage(ch, p.messageId);
-    if (msg) {
-      await msg.edit({ embeds: [embed], components: [] }).catch(() => {});
+    // 1) si hay messageId, intentar editar
+    if (p.messageId) {
+      const msg = await safeFetchMessage(ch, p.messageId);
+      if (msg) {
+        await msg.edit({ embeds: [plantEmbed(p)], components: [] }).catch(() => {});
+        return;
+      }
+      // si falló, lo limpiamos para que recupere por búsqueda
+      updatePlant({ id: p.id, messageId: null });
+      p.messageId = null;
+    }
+
+    // 2) buscar por PID en el canal (reusar)
+    const matches = await findPlantMessagesInChannel(ch, p.id);
+
+    if (matches.length > 0) {
+      const keep = matches[0];
+
+      // borrar duplicados si hay
+      for (const dup of matches.slice(1)) {
+        await deleteMessageIfPossible(dup);
+      }
+
+      updatePlant({ id: p.id, messageId: keep.id });
+
+      await keep.edit({ embeds: [plantEmbed(p)], components: [] }).catch(() => {});
       return;
     }
-    // si se perdió, lo recreamos 1 sola vez
-  }
 
-  const sent = await ch.send({ embeds: [embed] }).catch(() => null);
-  if (sent) updatePlant({ id: p.id, messageId: sent.id });
+    // 3) si no existe ninguno, crear UNO
+    const sent = await ch.send({ embeds: [plantEmbed(p)] }).catch(() => null);
+    if (sent) updatePlant({ id: p.id, messageId: sent.id });
+  } finally {
+    plantEnsureLock.delete(p.id);
+  }
 }
 
 // =====================
-// PLANT: ALERT SENDER (1 SOLO MENSAJE, MINIMO)
+// ALERTS: 1 SOLO MENSAJE, MINIMO, y se borra al tocar botón
 // =====================
 async function sendPlantAlert(p, kind) {
   const ch = await safeFetchChannel(client, p.channelId);
   if (!ch) return;
 
-  // Evitar duplicados: si ya hay un alert message guardado y existe, no mandar otro
   const alertKey =
     p.tipo === "duplicar" ? "alertMessageIdReady" :
     (kind === "regar" ? "alertMessageIdWater" : "alertMessageIdHarvest");
 
+  // evitar duplicado: si existe y está en canal, no mandes otro
   const existingId = p[alertKey];
   if (existingId) {
     const ex = await safeFetchMessage(ch, existingId);
-    if (ex) return; // ya está el mensaje, no duplicar
+    if (ex) return;
   }
 
   const pingInfo = await getRoleMentionForGuild(ch.guild);
@@ -452,7 +477,6 @@ async function sendPlantAlert(p, kind) {
     const patch = { id: p.id };
     patch[alertKey] = sent.id;
 
-    // marcar que ya alertó este ciclo
     if (p.tipo === "duplicar") patch.alertedReady = true;
     else if (kind === "regar") patch.alertedWater = true;
     else patch.alertedHarvest = true;
@@ -462,7 +486,7 @@ async function sendPlantAlert(p, kind) {
 }
 
 // =====================
-// CHESTER: REFRESH PANEL SAVED (edita SIEMPRE el mismo)
+// CHESTER: refrescar panel guardado
 // =====================
 async function refreshChesterPanel(userId) {
   const panel = DB.chesterPanels?.[userId];
@@ -482,7 +506,7 @@ async function refreshChesterPanel(userId) {
 }
 
 // =====================
-// SLASH COMMANDS
+// COMMANDS
 // =====================
 const commands = [
   new SlashCommandBuilder()
@@ -523,25 +547,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("chester")
-    .setDescription("🧰 Chester: panel de trabajos (CD 24h por trabajo) (público)"),
-
-  new SlashCommandBuilder()
-    .setName("tienda")
-    .setDescription("🏪 Iniciar cooldown de robo a tienda (solo/grupo)")
-    .addStringOption(opt =>
-      opt.setName("modo")
-        .setDescription("Modo")
-        .setRequired(true)
-        .addChoices(
-          { name: "Solo (5h)", value: "solo" },
-          { name: "Grupo (2h)", value: "grupo" },
-        )
-    )
-    .addStringOption(opt =>
-      opt.setName("nombre")
-        .setDescription("Nombre/tienda")
-        .setRequired(true)
-    ),
+    .setDescription("🧰 Chester: panel de trabajos (público, botones privados)"),
 
   new SlashCommandBuilder()
     .setName("cdarma")
@@ -560,24 +566,9 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("registro")
-    .setDescription("Ver registro completo (ADMIN)")
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addUserOption(opt =>
-      opt.setName("usuario")
-        .setDescription("Filtrar por usuario")
-        .setRequired(false)
-    ),
+    .setDescription("Ver registro (ADMIN)")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 ].map(c => c.toJSON());
-
-// Register commands
-async function registerCommands() {
-  const rest = new REST({ version: "10" }).setToken(TOKEN);
-  await rest.put(
-    Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
-    { body: commands }
-  );
-  console.log("✅ Comandos registrados:", commands.map(c => c.name).join(", "));
-}
 
 // =====================
 // READY
@@ -585,37 +576,34 @@ async function registerCommands() {
 client.once("ready", async () => {
   console.log(`🤖 Bot listo: ${client.user.tag}`);
 
-  // asegurar embeds originales
+  // Al iniciar: asegurar que cada plantación tenga SOLO 1 embed original
   for (const p of DB.plantaciones) {
     await ensurePlantMessage(p);
   }
 });
 
 // =====================
-// MAIN LOOP (cada 20s)
+// LOOP (20s)
 // =====================
 setInterval(async () => {
-  // Plantaciones: enviar alertas 1 sola vez por ciclo
+  // Plantaciones: alertas
   for (const p of DB.plantaciones) {
     try {
+      // asegurar embed original sin spam
+      await ensurePlantMessage(p);
+
       if (p.completed) continue;
 
       if (p.tipo === "duplicar") {
-        if (!p.alertedReady && now() >= p.readyAt) {
-          await sendPlantAlert(p, "cultivar");
-        }
+        if (!p.alertedReady && now() >= p.readyAt) await sendPlantAlert(p, "cultivar");
       } else {
-        if (!p.alertedWater && now() >= p.nextWaterAt) {
-          await sendPlantAlert(p, "regar");
-        }
-        if (!p.alertedHarvest && now() >= p.nextHarvestAt) {
-          await sendPlantAlert(p, "cosechar");
-        }
+        if (!p.alertedWater && now() >= p.nextWaterAt) await sendPlantAlert(p, "regar");
+        if (!p.alertedHarvest && now() >= p.nextHarvestAt) await sendPlantAlert(p, "cosechar");
       }
     } catch {}
   }
 
-  // Chester: cuando vuelve a estar disponible -> DM 1 vez + refrescar panel (habilita botones)
+  // Chester DM + refresh panel
   for (const userId of Object.keys(DB.chester)) {
     for (const job of Object.keys(DB.chester[userId] || {})) {
       if (isNotifiedKey(job)) continue;
@@ -640,7 +628,7 @@ setInterval(async () => {
     }
   }
 
-  // Armas: avisos por DM (1 vez por ts)
+  // Armas DM
   for (const userId of Object.keys(DB.armas)) {
     for (const key of Object.keys(DB.armas[userId] || {})) {
       if (isNotifiedKey(key)) continue;
@@ -669,7 +657,6 @@ setInterval(async () => {
 // =====================
 client.on("interactionCreate", async (interaction) => {
   try {
-    // Slash commands
     if (interaction.isChatInputCommand()) {
       const name = interaction.commandName;
 
@@ -701,7 +688,6 @@ client.on("interactionCreate", async (interaction) => {
           alertedWater: false,
           alertedHarvest: false,
 
-          // evitar spam duplicado de alertas
           alertMessageIdReady: null,
           alertMessageIdWater: null,
           alertMessageIdHarvest: null,
@@ -723,12 +709,6 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.reply({ ephemeral: true, content: `✅ Plantación creada (#${p.id}).` });
         await ensurePlantMessage(p);
 
-        logReg({
-          type: "plantacion_creada",
-          at: now(),
-          by: interaction.user.id,
-          meta: { plantId: p.id, tipo, descripcion: descripcion || null },
-        });
         return;
       }
 
@@ -738,10 +718,7 @@ client.on("interactionCreate", async (interaction) => {
 
         const lines = list.map((p, i) => {
           const num = i + 1;
-          if (p.completed) {
-            return `**#${num}** → ✅ **#${p.id}** • ${fmtTipo(p.tipo)} • Completada`;
-          }
-
+          if (p.completed) return `**#${num}** → ✅ **#${p.id}** • ${fmtTipo(p.tipo)} • Completada`;
           if (p.tipo === "duplicar") {
             return `**#${num}** → 🌿 **#${p.id}** • Duplicar • Cultivar: ${now() >= p.readyAt ? "✅ ahora" : relTs(p.readyAt)}`;
           }
@@ -761,16 +738,14 @@ client.on("interactionCreate", async (interaction) => {
         const p = getPlantByNumber(numero);
         if (!p) return interaction.reply({ ephemeral: true, content: "No existe esa plantación en la lista." });
 
-        // borrar embed original si existe
         const ch = await safeFetchChannel(client, p.channelId);
-        if (ch && p.messageId) {
-          const msg = await safeFetchMessage(ch, p.messageId);
-          await deleteMessageIfPossible(msg);
+        if (ch) {
+          // borrar todos los embeds originales de esa plantación (si se duplicó)
+          const matches = await findPlantMessagesInChannel(ch, p.id);
+          for (const m of matches) await deleteMessageIfPossible(m);
         }
 
         removePlant(p.id);
-        logReg({ type: "plantacion_borrada", at: now(), by: interaction.user.id, meta: { plantId: p.id } });
-
         return interaction.reply({ ephemeral: true, content: `🗑️ Plantación #${p.id} eliminada.` });
       }
 
@@ -779,17 +754,17 @@ client.on("interactionCreate", async (interaction) => {
         if (!DB.chester[userId]) DB.chester[userId] = {};
         saveJSON("chester.json", DB.chester);
 
-        // Si ya hay panel guardado, editar ese MISMO (no crear otro)
         const existed = await refreshChesterPanel(userId);
         if (existed) {
           return interaction.reply({ ephemeral: true, content: "✅ Panel de Chester actualizado (mismo mensaje guardado)." });
         }
 
-        // si no hay panel, crear y guardar
-        const e = chesterEmbed(userId);
-        const rows = chesterButtons(userId);
-
-        const sent = await interaction.reply({ ephemeral: false, embeds: [e], components: rows, fetchReply: true });
+        const sent = await interaction.reply({
+          ephemeral: false,
+          embeds: [chesterEmbed(userId)],
+          components: chesterButtons(userId),
+          fetchReply: true,
+        });
 
         if (sent?.id) {
           DB.chesterPanels[userId] = { channelId: interaction.channelId, messageId: sent.id };
@@ -798,39 +773,16 @@ client.on("interactionCreate", async (interaction) => {
         return;
       }
 
-      if (name === "tienda") {
-        const modo = interaction.options.getString("modo", true);
-        const nombre = interaction.options.getString("nombre", true).trim();
-
-        const cd = modo === "grupo" ? TIENDA_CD_GRUPO_MS : TIENDA_CD_SOLO_MS;
-        const key = `${modo}|${nombre.toLowerCase()}`;
-
-        if (!DB.tienda[interaction.user.id]) DB.tienda[interaction.user.id] = {};
-        DB.tienda[interaction.user.id][key] = now() + cd;
-        DB.tienda[interaction.user.id][`${key}_notified`] = false;
-        saveJSON("tienda.json", DB.tienda);
-
-        logReg({ type: "tienda_inicio", at: now(), by: interaction.user.id, meta: { modo, nombre } });
-
-        const e = tiendaEmbed(interaction.user.id, modo, nombre, now() + cd);
-        return interaction.reply({ ephemeral: true, embeds: [e], content: "✅ CD iniciado. Te aviso por DM cuando esté listo." });
-      }
-
       if (name === "cdarma") {
         const key = interaction.options.getString("tipo", true);
-
-        if (!ARMA_CD[key]) {
-          return interaction.reply({ ephemeral: true, content: "Tipo inválido." });
-        }
+        if (!ARMA_CD[key]) return interaction.reply({ ephemeral: true, content: "Tipo inválido." });
 
         if (!DB.armas[interaction.user.id]) DB.armas[interaction.user.id] = {};
 
         const nextTs = now() + ARMA_CD[key];
         DB.armas[interaction.user.id][key] = nextTs;
-        DB.armas[interaction.user.id][`${key}_notifiedTs`] = 0; // reset antispam para este nuevo ts
+        DB.armas[interaction.user.id][`${key}_notifiedTs`] = 0;
         saveJSON("armas.json", DB.armas);
-
-        logReg({ type: "arma_cd_inicio", at: now(), by: interaction.user.id, meta: { tipo: key } });
 
         return interaction.reply({
           ephemeral: true,
@@ -840,26 +792,20 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (name === "registro") {
-        const usuario = interaction.options.getUser("usuario");
-        const entries = DB.registro.slice();
-        const filtered = usuario ? entries.filter(e => e.by === usuario.id) : entries;
-        if (filtered.length === 0) return interaction.reply({ ephemeral: true, content: "No hay registros para mostrar." });
-
-        const lines = filtered
-          .slice(-50)
+        const lines = DB.registro
+          .slice(-60)
           .map(e => `• ${absTs(e.at)} — **${e.type}** — <@${e.by}>`)
           .join("\n");
 
         const em = new EmbedBuilder()
           .setTitle("📚 Registro")
           .setColor(0x34495e)
-          .setDescription(lines.slice(0, 4000));
+          .setDescription(lines || "—");
 
         return interaction.reply({ ephemeral: true, embeds: [em] });
       }
     }
 
-    // Buttons
     if (interaction.isButton()) {
       const id = interaction.customId;
 
@@ -870,6 +816,7 @@ client.on("interactionCreate", async (interaction) => {
         const plantId = parseInt(parts[2], 10);
 
         const p = DB.plantaciones.find(x => x.id === plantId);
+
         if (!p) {
           await deleteMessageIfPossible(interaction.message);
           return interaction.reply({ ephemeral: true, content: "Esa plantación ya no existe." });
@@ -885,7 +832,6 @@ client.on("interactionCreate", async (interaction) => {
             return interaction.reply({ ephemeral: true, content: `Aún no está lista. ${relTs(p.readyAt)}` });
           }
 
-          // marcar completada, limpiar alert msg id
           updatePlant({
             id: p.id,
             completed: true,
@@ -896,11 +842,7 @@ client.on("interactionCreate", async (interaction) => {
           const updated = DB.plantaciones.find(x => x.id === p.id);
           await ensurePlantMessage(updated);
 
-          // borrar el mensaje de alerta (spam)
           await deleteMessageIfPossible(interaction.message);
-
-          logReg({ type: "plantacion_completada", at: now(), by: interaction.user.id, meta: { plantId: p.id, tipo: p.tipo } });
-
           return interaction.reply({ ephemeral: true, content: `✅ Plantación #${p.id} completada.` });
         }
 
@@ -925,16 +867,13 @@ client.on("interactionCreate", async (interaction) => {
               lastWaterBy: interaction.user.id,
               nextWaterAt: newWaterAt,
               alertedWater: false,
-              alertMessageIdWater: null, // ✅ permitir nuevo mensaje en el próximo ciclo, pero no duplicar este
+              alertMessageIdWater: null,
             });
 
             const updated = DB.plantaciones.find(x => x.id === p.id);
             await ensurePlantMessage(updated);
 
             await deleteMessageIfPossible(interaction.message);
-
-            logReg({ type: "plantacion_regada", at: now(), by: interaction.user.id, meta: { plantId: p.id } });
-
             return interaction.reply({ ephemeral: true, content: `💧 Regada. Próximo riego: ${relTs(newWaterAt)}` });
           }
 
@@ -952,8 +891,6 @@ client.on("interactionCreate", async (interaction) => {
                 lastHarvestBy: interaction.user.id,
                 completed: true,
                 completedAt: now(),
-                alertedHarvest: true,
-                alertedWater: true,
                 alertMessageIdHarvest: null,
               });
 
@@ -961,9 +898,6 @@ client.on("interactionCreate", async (interaction) => {
               await ensurePlantMessage(updated);
 
               await deleteMessageIfPossible(interaction.message);
-
-              logReg({ type: "plantacion_completada", at: now(), by: interaction.user.id, meta: { plantId: p.id, tipo: p.tipo } });
-
               return interaction.reply({ ephemeral: true, content: `✅ Cosecha finalizada (3/3).` });
             }
 
@@ -981,13 +915,9 @@ client.on("interactionCreate", async (interaction) => {
             await ensurePlantMessage(updated);
 
             await deleteMessageIfPossible(interaction.message);
-
-            logReg({ type: "plantacion_cosechada", at: now(), by: interaction.user.id, meta: { plantId: p.id, count: newCount } });
-
             return interaction.reply({ ephemeral: true, content: `🧺 Cosechada (${newCount}/${MAX_COSECHAS}). Próxima: ${relTs(newHarvestAt)}` });
           }
         }
-
         return;
       }
 
@@ -995,7 +925,6 @@ client.on("interactionCreate", async (interaction) => {
       if (id.startsWith("chester_")) {
         const [, job, userId] = id.split("_");
 
-        // solo dueño
         if (interaction.user.id !== userId) {
           return interaction.reply({ ephemeral: true, content: "🔒 Este panel es personal. Usá /chester para el tuyo." });
         }
@@ -1015,13 +944,9 @@ client.on("interactionCreate", async (interaction) => {
         DB.chester[userId][`${job}_notifiedTs`] = 0;
         saveJSON("chester.json", DB.chester);
 
-        // guardar panel SIEMPRE (así aunque se toque de nuevo, conserva la info y edita el mismo)
         DB.chesterPanels[userId] = { channelId: interaction.channelId, messageId: interaction.message.id };
         saveJSON("chester_panels.json", DB.chesterPanels);
 
-        logReg({ type: "chester_job", at: now(), by: interaction.user.id, meta: { job } });
-
-        // update del mismo embed (no spam)
         return interaction.update({
           embeds: [chesterEmbed(userId)],
           components: chesterButtons(userId),
@@ -1045,15 +970,9 @@ client.on("interactionCreate", async (interaction) => {
     process.exit(1);
   }
 
-  // registrar comandos
   const rest = new REST({ version: "10" }).setToken(TOKEN);
   await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
   console.log("✅ Comandos registrados:", commands.map(c => c.name).join(", "));
 
   await client.login(TOKEN);
 })();
-
-
-
-
-
